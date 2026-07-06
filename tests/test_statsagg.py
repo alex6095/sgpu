@@ -699,7 +699,12 @@ class TestUnicodeAsciiModes(unittest.TestCase):
             result = self._two_day_result(d)
         text = statsagg.render_stats_text(result, color=True, unicode_ok=True)
         self.assertIn("\x1b[48;5;", text)  # grass 256-color backgrounds
-        self.assertIn("\x1b[38;5;", text)  # heatmap 256-color foregrounds
+        # The KST heatmap uses the same background-cell language as the
+        # grass: empty hours get the dark base cell so rows read as one
+        # contiguous strip (never sparse foreground sparks).
+        heat = text.split("KST hour activity", 1)[1]
+        self.assertIn("\x1b[48;5;238m", heat)   # empty-hour base cells
+        self.assertNotIn("\x1b[38;5;", heat)    # no fg sparks anymore
 
     def test_leaderboard_full_names(self):
         # owner names longer than 3 chars must appear in full in the report.

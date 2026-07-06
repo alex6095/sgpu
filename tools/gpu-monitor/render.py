@@ -128,10 +128,13 @@ def layout_header(snapshot, width):
 def layout_gpus(snapshot, width, unicode_ok=True):
     bar_w = 10 if width >= 96 else (8 if width >= 80 else 6)
     show_owners = width >= 84
-    header = "GPU NAME      UTIL %s      MEM %s               TEMP  POWER" % (
-        " " * bar_w, " " * bar_w)
+    # Header is composed with the exact same column widths as the data rows
+    # below (left 14, util span bar_w+9, mem span bar_w+17, "%4s  %9s" tail)
+    # so TEMP/POWER/OWNERS always line up regardless of bar width.
+    header = "%3s %-9s %-*s%-*s%4s  %9s" % (
+        "GPU", "NAME", bar_w + 9, "UTIL", bar_w + 17, "MEM", "TEMP", "POWER")
     if show_owners:
-        header += "      OWNERS"
+        header += "  OWNERS"
     lines = [[(clip(header, width), "header")]]
     for gpu in snapshot.get("gpus", []):
         util = gpu.get("util")

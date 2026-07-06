@@ -647,12 +647,31 @@ def query(data_dir, days=7, owner=None, now_fn=None):
 
     current_idle = _current_idle(data_dir, today_str, owner, now_fn)
 
+    # Structured awards so JSON consumers (the TUI stats view) don't have to
+    # duplicate the threshold logic. Text format is "Title: owner — detail".
+    awards = []
+    for key, own, text in _compute_awards(
+            merged.get("owners") or {},
+            merged.get("pods_coverage_seconds", 0.0),
+            merged.get("coverage_seconds", 0.0)):
+        title, _, rest = text.partition(": ")
+        _owner_part, sep, detail = rest.partition(" — ")
+        awards.append({
+            "key": key,
+            "icon": _award_prefix(key, True),
+            "ascii": _award_prefix(key, False),
+            "title": title,
+            "owner": own,
+            "detail": detail if sep else rest,
+        })
+
     return {
         "window_days": days,
         "dates_covered": dates_covered,
         "merged": merged,
         "current_idle": current_idle,
         "daily": daily,
+        "awards": awards,
         "generated_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
@@ -958,30 +977,28 @@ def render_stats_text(result, color=False, width=100, unicode_ok=True):
         _render_grass(lines, ranked, daily, dates, ow, color, unicode_ok, width)
 
     # --- e. KST hour heatmap ---
+    # Same visual language as the grass calendar: a contiguous strip of
+    # 2-char background-colored cells per hour (empty hours get the dark
+    # base cell), so the strip reads as one bar instead of sparse dots.
     lines.append(_c("bold", "KST hour activity (gpu-seconds share)", color))
-    header_cells = " ".join("%2d" % h for h in range(24))
-    lines.append("%-*s %s" % (ow, "KST", header_cells))
-    # Spark glyphs: unicode blocks when allowed, else ascii ramp.
-    spark = SPARK if unicode_ok else " .:-=+*#"[1:]  # 7 ascii ramp levels
+    ticks = [" "] * 48
+    for h in range(0, 24, 3):
+        for j, ch in enumerate(str(h)):
+            if 2 * h + j < 48:
+                ticks[2 * h + j] = ch
+    lines.append(_c("dim", "%-*s %s" % (ow, "KST", "".join(ticks)), color))
+    glyphs = GRASS_UNICODE if unicode_ok else GRASS_ASCII
 
-    def spark_row(label, hist):
+    def heat_row(label, hist):
         mx = max(hist) if hist else 0.0
-        # two-char columns to align with the numeric header
         parts = []
         for v in hist:
-            lvl = _bucket_level(v, mx, len(spark))
-            if lvl == 0:
-                parts.append("  ")
-                continue
-            ch = spark[lvl - 1]
+            lvl = _bucket_level(v, mx, 5)
             if color:
-                # green gradient fg by intensity bucket
-                fg = SPARK_FG[_bucket_level(v, mx, len(SPARK_FG)) - 1]
-                parts.append(" " + _fg256(fg, ch))
+                parts.append(_bg256(GRASS_BG[lvl], "  "))
             else:
-                parts.append(" " + ch)
-        body = " ".join(parts)
-        return "%-*s %s" % (ow, _clip(label, ow), body)
+                parts.append(glyphs[lvl] * 2)
+        return "%-*s %s" % (ow, _clip(label, ow), "".join(parts))
 
     top8 = ranked[:8]
     total_hist = [0.0] * 24
@@ -991,8 +1008,8 @@ def render_stats_text(result, color=False, width=100, unicode_ok=True):
             total_hist[i] += hh[i] if i < len(hh) else 0.0
 
     for owner, acc in top8:
-        lines.append(spark_row(owner, acc.get("hour_hist_kst", [0.0] * 24)))
-    lines.append(spark_row("TOTAL", total_hist))
+        lines.append(heat_row(owner, acc.get("hour_hist_kst", [0.0] * 24)))
+    lines.append(heat_row("TOTAL", total_hist))
     lines.append("")
 
     # --- f. warnings ---
