@@ -291,14 +291,15 @@ def run_tui(stdscr, curses, fetcher, view):
         filtered = dict(shown, procs=procs)
         header_lines = render.layout_header(shown, width)
         gpu_lines = render.layout_gpus(shown, width, bars_unicode)
+        storage_lines = render.layout_storage(shown, width, bars_unicode)
         proc_layout = render.layout_procs(filtered, width)
         pod_layout = render.layout_pods(dict(shown, pods=dict(
             shown.get("pods") or {}, rows=pods)), width)
 
         # Vertical budget: header 1 + blank + gpus + blank + procs header 2
         # + procs rows (flex) + blank + pods (<=8, collapses first) + footer.
-        fixed_top = len(header_lines) + 1 + len(gpu_lines) + 1 \
-            + len(proc_layout["header"])
+        fixed_top = len(header_lines) + 1 + len(gpu_lines) \
+            + len(storage_lines) + 1 + len(proc_layout["header"])
         pods_block = 1 + len(pod_layout["header"]) \
             + min(len(pod_layout["rows"]), 6)
         if height < 24:
@@ -322,6 +323,9 @@ def run_tui(stdscr, curses, fetcher, view):
             y += 1
         y += 1
         for line in gpu_lines:
+            draw_segments(stdscr, curses, y, line, attrs, width)
+            y += 1
+        for line in storage_lines:
             draw_segments(stdscr, curses, y, line, attrs, width)
             y += 1
         y += 1

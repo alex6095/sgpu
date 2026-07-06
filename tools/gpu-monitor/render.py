@@ -212,6 +212,29 @@ def layout_procs(snapshot, width, now=None):
     return {"header": [title, head], "rows": rows}
 
 
+def fmt_tib(nbytes):
+    if nbytes is None:
+        return "?"
+    return "%.1fT" % (nbytes / float(1024 ** 4))
+
+
+def layout_storage(snapshot, width, unicode_ok=True):
+    storage = snapshot.get("storage")
+    if not storage:
+        return []
+    pct = storage.get("pct") or 0.0
+    tag = "crit" if pct >= 95 else ("warn" if pct >= 85 else "ok")
+    bar_w = 10 if width >= 96 else 8
+    line = _seg_line(
+        ("STORAGE %-11s " % clip(storage.get("label", "?"), 11), "header"),
+        ("[%s] %4.1f%%  " % (make_bar(pct, bar_w, unicode_ok), pct), tag),
+        ("%s/%s used, %s free" % (fmt_tib(storage.get("used_bytes")),
+                                  fmt_tib(storage.get("total_bytes")),
+                                  fmt_tib(storage.get("free_bytes"))), tag),
+    )
+    return [line]
+
+
 def layout_pods(snapshot, width):
     pods = snapshot.get("pods") or {}
     title = [(clip("Kubernetes GPU pods on this node", width), "section")]
@@ -266,6 +289,10 @@ def render_text(snapshot, width=120, color=False, unicode_ok=True,
     pods = layout_pods(snapshot, width)
     lines.extend(pods["header"])
     lines.extend(pods["rows"])
+    storage = layout_storage(snapshot, width, unicode_ok)
+    if storage:
+        lines.append([])
+        lines.extend(storage)
     for note in footer_notes:
         lines.append([(clip(note, width), "dim")])
     return "\n".join(paint(line, color) for line in lines) + "\n"

@@ -23,7 +23,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
-SGPU_VERSION = "0.5.0"
+SGPU_VERSION = "0.6.0"
 SCHEMA = 2
 
 MOCK = os.environ.get("SGPU_MOCK", "") == "1"
@@ -449,6 +449,37 @@ def _mock_snapshot(now):
     }
 
 
+# --- shared storage ----------------------------------------------------------
+
+
+STORAGE_LABEL = os.environ.get("SGPU_STORAGE_LABEL", "pv-01/pv-02")
+STORAGE_PATH = os.environ.get("SGPU_DATA_DIR", "/var/lib/sgpu")
+
+
+def _storage_info():
+    """Usage of the filesystem backing the shared lab volume. The stats dir
+    is a subPath on pv-01, and statvfs reports the whole underlying array
+    (pv-01 and pv-02 share one disk), so this is the lab-wide view."""
+    if MOCK:
+        total = 42.0 * 1024 ** 4
+        used = 35.0 * 1024 ** 4
+        return {"label": STORAGE_LABEL, "total_bytes": int(total),
+                "used_bytes": int(used), "free_bytes": int(total - used),
+                "pct": round(100.0 * used / total, 1)}
+    try:
+        st = os.statvfs(STORAGE_PATH)
+    except (OSError, AttributeError):  # missing mount, or Windows dev box
+        return None
+    total = st.f_blocks * st.f_frsize
+    free = st.f_bavail * st.f_frsize
+    if total <= 0:
+        return None
+    used = total - free
+    return {"label": STORAGE_LABEL, "total_bytes": total,
+            "used_bytes": used, "free_bytes": free,
+            "pct": round(100.0 * used / total, 1)}
+
+
 # --- public API --------------------------------------------------------------
 
 
@@ -530,6 +561,7 @@ def collect(include_pods=True, force=False):
             "gpus": gpus,
             "procs": procs,
             "pods": pods,
+            "storage": _storage_info(),
         }
         if base.get("error"):
             snapshot["error"] = base["error"]
