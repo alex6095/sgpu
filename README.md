@@ -1,227 +1,109 @@
 # SGPU
 
-**SGVR GPU** / **S**imple **GPU** monitor — a zero-fuss way to check the
-MLXP H200 GPU nodes before you decide whether to launch a pod.
+**SGVR GPU** / **S**imple **GPU** monitor for the lab's MLXP H200 nodes —
+check the GPUs before you launch a pod.
 
-- **Zero-install**: anyone with `kubectl` gets the full dashboard and TUI.
-- **Who is using what**: every GPU process is attributed to its Kubernetes
-  pod and owner (`yoonki-ume-...` → `yoonki`), including `nvitop`-style bars.
-- **Usage accounting**: per-owner GPU-hours, utilization, memory efficiency,
-  idle-allocation warnings and a KST time-of-day heatmap, recorded 24/7.
-- The monitor pod is read-only and requests **no GPU** (CPU/memory only).
+- Every GPU process is attributed to its **pod and owner** (not just a PID).
+- **In-pod TUI** (`kubectl exec -it`) — smooth like nvitop, scroll/sort/filter.
+- **Usage stats 24/7**: per-owner GPU-hours, awards, GitHub-style activity
+  calendar, idle-allocation warnings (KST).
+- Shared **storage (pv-01/pv-02) usage** at a glance.
+- Monitor pod is read-only, always-on, and requests **no GPU**.
 
-## Zero-install usage (kubectl only)
-
-No install needed — these work for every lab member as-is:
+## Install
 
 ```bash
-# Interactive TUI (scroll, sort, owner filter — like nvitop, plus pod owners)
+uvx sgpu            # run without installing (uv)
+pipx install sgpu   # or pipx
+pip install sgpu    # or plain pip (WSL/Ubuntu: add --user --break-system-packages)
+```
+
+Needs `kubectl` configured for the MLXP namespace
+([kubectl setup](#kubectl-setup-linuxwsl)).
+
+## Use
+
+```text
+sgpu               interactive TUI      sgpu stats [days]  usage report + awards
+sgpu once          one-shot dashboard   sgpu apps          processes + owners
+sgpu watch [sec]   dumb-terminal loop   sgpu nvitop        raw nvitop
+sgpu pods|smi|gpustat|json|health|version|--help
+```
+
+TUI keys: `j/k` scroll · `Tab` pane · `s` sort · `o` owner filter · `p` pause · `q` quit.
+Options: `-n` namespace, `--pod`, `-r` refresh, `--no-color`. Env: `SGPU_NAMESPACE`, `SGPU_POD`.
+
+### Zero-install (kubectl only)
+
+```bash
 kubectl exec -it -n p-sgvr-node-02 sangmin-gpu-monitor -- python3 /opt/gpu-monitor/tui.py
-
-# One-shot dashboard
 kubectl exec -n p-sgvr-node-02 sangmin-gpu-monitor -- curl -fsS http://127.0.0.1:8080/table
-
-# Raw nvitop / nvidia-smi
-kubectl exec -it -n p-sgvr-node-02 sangmin-gpu-monitor -- nvitop
-kubectl exec -n p-sgvr-node-02 sangmin-gpu-monitor -- nvidia-smi
-
-# Usage report (last 7 days)
-kubectl exec -n p-sgvr-node-02 sangmin-gpu-monitor -- curl -fsS "http://127.0.0.1:8080/stats?days=7"
 ```
 
-The `sgpu` command below is just a short wrapper around these.
+Endpoints on `:8080`: `/table /apps /json /stats /pods /smi /topo /gpustat
+/health /version /stats/files /stats/raw?date=` (`?color=1&cols=N&ascii=1`).
 
-## Install the `sgpu` command
+## Stats
 
-Requirements: `kubectl` configured for the MLXP namespace (see
-[Linux / WSL kubectl setup](#linux--wsl-kubectl-setup) if starting fresh).
+Sampled every 15 s around the clock into raw JSONL (full fidelity — future
+tools can recompute anything), gzipped + rolled up daily, stored on the
+shared volume at `pv-01/sangmin/sgpu`. Retention 365 d, capped at 2 GB.
+`sgpu stats 30` shows the leaderboard, awards, daily activity calendar and
+KST hour heatmap. Raw export: `/stats/raw?date=YYYYMMDD`.
 
-**Windows** (PowerShell, from this repo):
+> The monitor pod must stay running for stats to accumulate — it is designed
+> to (tini init, `restartPolicy: Always`, no GPU held).
 
-```powershell
-.\scripts\install-sgpu.ps1     # creates %USERPROFILE%\bin\sgpu.cmd
-```
+## Deploy / operate
 
-**Linux / WSL / macOS**:
+Image push works **from anywhere** via the registry's public endpoint
+(`sgvr-registry.kr.ncr.ntruss.com`); the cluster pulls via the private
+endpoint (`vnxb4cz3.kr.private-ncr.ntruss.com`, in-cluster only — preferred
+per the MLXP guide). API key: NCP console → Access Management.
 
 ```bash
-./scripts/install-sgpu.sh      # symlinks to ~/.local/bin/sgpu
-```
+docker login sgvr-registry.kr.ncr.ntruss.com
+docker build -f docker/Dockerfile.gpu-monitor -t sgvr-registry.kr.ncr.ntruss.com/sangmin/gpu-monitor:TAG .
+docker push sgvr-registry.kr.ncr.ntruss.com/sangmin/gpu-monitor:TAG
 
-## Commands
-
-```text
-sgpu               interactive TUI (default)
-sgpu once          one-shot dashboard
-sgpu watch [sec]   simple refresh loop (dumb terminals / CI)
-sgpu apps          GPU process table with pod owners
-sgpu stats [days]  per-owner usage report (default 7 days)
-sgpu nvitop        raw nvitop TUI
-sgpu pods          GPU-requesting pods (JSON)
-sgpu smi           raw nvidia-smi
-sgpu gpustat       gpustat output
-sgpu json          full snapshot (JSON, schema 2)
-sgpu health | version | help
-```
-
-Options (both platforms): namespace `-n/-Namespace`, pod `--pod/-Pod`,
-refresh `-r/-Refresh`, `--no-color/-NoColor`. Env vars: `SGPU_NAMESPACE`,
-`SGPU_POD`.
-
-### TUI keys
-
-```text
-j/k or ↑/↓   scroll        Tab   switch pane (processes / pods)
-PgUp/PgDn    page          s     cycle sort (gpu / mem / owner)
-g/G          top/bottom    o     cycle owner filter
-p            pause         r     force refresh
-q            quit
-```
-
-The refresh loop runs **inside the pod**, so the TUI is smooth from any
-client — there is no per-frame kubectl round trip.
-
-## Usage statistics
-
-The monitor samples every GPU, process (with pod/owner attribution) and
-GPU-requesting pod every 15 seconds, around the clock:
-
-- **Raw samples**: `samples-YYYYMMDD.jsonl` (UTC days) — full fidelity
-  (util, SM% per process, memory, power, temperature, pod allocation), so
-  future analysis tools can recompute any statistic from raw data.
-  Yesterday's file is gzipped and summarized into `rollup-YYYYMMDD.json`
-  on rollover. Retention 365 days, total size capped at 2 GB.
-- **Report** (`sgpu stats [days]`): per-owner leaderboard (GPU-hours,
-  average SM%/util, peak memory, allocated-vs-idle hours), low-utilization
-  warnings, pods that hold GPUs idle right now, and a KST hour-of-day
-  activity heatmap.
-- **Raw export**: `/stats/raw?date=YYYYMMDD` (NDJSON) and `/stats/files`.
-
-Storage is the lab's shared persistent volume `pv-01`, mounted at
-`/var/lib/sgpu` via `subPath: sangmin/sgpu` — so history lives alongside the
-rest of the lab's durable data and survives pod restarts. `subPath` keeps
-the privileged pod scoped to its own stats directory rather than the whole
-24 TB volume, and `pv-01`'s node affinity co-schedules the monitor onto the
-node whose GPUs it watches. (`hostPath` is denied by the cluster's kyverno
-policy; a dedicated `local-path` PVC works too but is one more artifact to
-manage.)
-
-Inspect the raw stats from any pod that mounts `pv-01`, e.g. the dind pod:
-
-```bash
-kubectl exec -n p-sgvr-node-02 sangmin-ulr-v2-dind-dev -c dev -- ls -la /pv-01/sangmin/sgpu
-```
-
-## HTTP endpoints (inside the pod, `:8080`)
-
-```text
-/table   dashboard (plain by default; ?color=1, ?cols=N, ?ascii=1)
-/apps    process table          /pods    pods JSON
-/json    snapshot (schema 2)    /stats   usage report (?days=N&format=json)
-/smi /topo /gpustat /health /version /stats/files /stats/raw?date=
-```
-
-## Deploy / operate the monitor pod
-
-The NCR registry (`vnxb4cz3.kr.private-ncr.ntruss.com`) resolves to a
-**private IP** — it is reachable only from inside the cluster network, so
-build and push from a dind pod, not from your laptop:
-
-```bash
-IMG=vnxb4cz3.kr.private-ncr.ntruss.com/sangmin/gpu-monitor:nvml-580.126.16-v5
-DIND="kubectl exec -n p-sgvr-node-02 sangmin-ulr-v2-dind-dev -c docker-cli --"
-
-# 1. Copy the (tiny) build context into the dind pod and build
-tar cf - docker tools .dockerignore | kubectl exec -i -n p-sgvr-node-02 \
-  sangmin-ulr-v2-dind-dev -c docker-cli -- \
-  sh -c 'rm -rf /tmp/sgpu-build && mkdir -p /tmp/sgpu-build && tar xf - -C /tmp/sgpu-build'
-$DIND sh -c "cd /tmp/sgpu-build && docker build -f docker/Dockerfile.gpu-monitor -t $IMG ."
-
-# 2. Login (interactive), push, then REMOVE the stored credential
-kubectl exec -it -n p-sgvr-node-02 sangmin-ulr-v2-dind-dev -c docker-cli -- \
-  docker login vnxb4cz3.kr.private-ncr.ntruss.com
-$DIND docker push "$IMG"
-$DIND docker logout vnxb4cz3.kr.private-ncr.ntruss.com
-
-# 3. Pods are immutable — recreate to roll out
 kubectl delete pod sangmin-gpu-monitor -n p-sgvr-node-02 --ignore-not-found
-kubectl apply -f k8s/gpu-monitor.yaml
+kubectl apply -f k8s/gpu-monitor.yaml   # pods are immutable: delete + apply
 kubectl wait --for=condition=Ready pod/sangmin-gpu-monitor -n p-sgvr-node-02 --timeout=180s
 ```
 
-### Enable the pod-allocation view (recommended, one command)
-
-The pod's own service account cannot list pods (403), so out of the box the
-dashboard attributes only *running processes*. To also see **allocated
-pods** (including "holds GPUs but runs nothing"), give the server a
-kubeconfig:
+Optional (enables the pod-allocation view + idle stats; kubelet syncs it in
+within a minute, no restart):
 
 ```bash
-kubectl -n p-sgvr-node-02 create secret generic sgpu-kubeconfig \
-  --from-file=config=$HOME/.kube/config
+kubectl -n p-sgvr-node-02 create secret generic sgpu-kubeconfig --from-file=config=$HOME/.kube/config
 ```
 
-No pod restart needed — kubelet syncs the optional secret within a minute.
+> Anyone with exec access to the monitor pod can read that token — fine
+> inside a trusting lab namespace; use your least-privileged kubeconfig.
 
-> **Security note**: anyone with `exec` access to the monitor pod can read
-> that token. This is acceptable inside a trusting lab namespace; use the
-> least-privileged kubeconfig you have.
-
-## How it works
-
-```text
-┌─ your machine ──────────┐   ┌─ monitor pod (privileged, hostPID, no GPU req) ─┐
-│ sgpu  (thin wrapper)    │   │ server.py: NVML snapshots + /proc attribution   │
-│  └─ kubectl exec ──────────▶│   ├─ /table /json /stats ... (renders ANSI)     │
-│  └─ kubectl exec -it ──────▶│ tui.py (curses, reads local /json)              │
-└─────────────────────────┘   │ statsdb: 15s JSONL samples → rollups (hostPath) │
-                              └──────────────────────────────────────────────────┘
-```
-
-Process → pod attribution reads `/proc/<pid>/environ` (`HOSTNAME` is the pod
-name; hostPID makes GPU PIDs visible), with a cgroup-UID fallback. The owner
-is the pod-name prefix before the first `-`/`_`. Known limits: pods that
-override `spec.hostname`, and MPS-shared contexts, may attribute to `?` or
-to the MPS server pod.
-
-## Linux / WSL kubectl setup
-
-If the machine does not have `kubectl` yet (fresh WSL Ubuntu, for example):
+## kubectl setup (Linux/WSL)
 
 ```bash
-mkdir -p ~/.local/bin
+mkdir -p ~/.local/bin ~/.kube
 V=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
-curl -fsSL -o ~/.local/bin/kubectl "https://dl.k8s.io/release/${V}/bin/linux/amd64/kubectl"
-chmod +x ~/.local/bin/kubectl
-```
-
-Install the kubeconfig (the file already contains a bearer token, so no
-extra login is needed):
-
-```bash
-mkdir -p ~/.kube
-cp /path/to/sgvr-node-02-kubeconfig.yaml ~/.kube/config
-chmod 600 ~/.kube/config
+curl -fsSL -o ~/.local/bin/kubectl "https://dl.k8s.io/release/${V}/bin/linux/amd64/kubectl" && chmod +x ~/.local/bin/kubectl
+cp /path/to/sgvr-node-02-kubeconfig.yaml ~/.kube/config && chmod 600 ~/.kube/config
 kubectl get pods -n p-sgvr-node-02   # connectivity test
 ```
-
-In WSL, the Windows Downloads path is `/mnt/c/Users/<you>/Downloads/...`.
 
 ## Development
 
 ```bash
-# Everything runs without a GPU in mock mode:
-SGPU_MOCK=1 python3 tools/gpu-monitor/server.py    # then curl :8080/table
+SGPU_MOCK=1 python3 tools/gpu-monitor/server.py   # full pipeline, no GPU needed
 SGPU_MOCK=1 python3 tools/gpu-monitor/tui.py
-python3 -m unittest discover -s tests              # stats pipeline tests
+python3 -m unittest discover -s tests
 ```
 
-## Troubleshooting
+How it works: `sgpu` (thin Python client) → `kubectl exec` → monitor pod
+(privileged, hostPID) where server.py renders everything; process→pod
+attribution reads `/proc/<pid>/environ` (`HOSTNAME` = pod name), owner =
+pod-name prefix. Known limits: pods overriding `spec.hostname` and MPS show
+as `?`.
 
-- **Terminal looks broken after the TUI** (dropped connection): run `reset`.
-- **TUI frozen**: long `kubectl exec` sessions can be cut by load balancers —
-  just rerun `sgpu`.
-- **Garbled box characters on Windows**: use Windows Terminal, or add
-  `?ascii=1` / use `sgpu once -NoColor`.
-- **`pod allocation view disabled`** in the dashboard: create the
-  `sgpu-kubeconfig` secret (see above).
+Troubleshooting: broken terminal after a dropped TUI → `reset` · frozen TUI
+→ rerun `sgpu` · garbled bars → Windows Terminal or `--no-color`.

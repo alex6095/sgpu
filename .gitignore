@@ -6,3 +6,5 @@ Thumbs.db
 *.tmp
 __pycache__/
 *.pyc
+dist/
+*.egg-info/
