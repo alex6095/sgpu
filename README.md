@@ -56,9 +56,10 @@ Env: `SGPU_NAMESPACE`, `SGPU_POD`.
 
 ## Screenshots
 
+### Process Attribution
+
 <p align="center">
-  <img src="docs/images/sgpu-processes.svg" alt="SGPU process attribution" width="49%">
-  <img src="docs/images/sgpu-stats.svg" alt="SGPU usage stats" width="49%">
+  <img src="docs/images/sgpu-processes.svg" alt="SGPU process attribution" width="100%">
 </p>
 
 ## Zero Install
@@ -88,6 +89,10 @@ up daily summaries, and stores the results on the shared volume at
 
 Retention defaults to 365 days and is capped at 2 GB. `sgpu stats 30` shows
 leaderboards, awards, daily activity, and KST hour heatmaps.
+
+<p align="center">
+  <img src="docs/images/sgpu-stats.svg" alt="SGPU stats report" width="100%">
+</p>
 
 > The monitor pod must stay running for stats to accumulate. It is designed to
 > do that with tini init, `restartPolicy: Always`, and no GPU allocation.
