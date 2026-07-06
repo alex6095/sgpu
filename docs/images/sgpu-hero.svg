@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="990" viewBox="0 0 1600 990">
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#06101f"/>
+      <stop offset="48%" stop-color="#0b1220"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="18%" cy="0%" r="68%">
+      <stop offset="0%" stop-color="#0891b2" stop-opacity="0.28"/>
+      <stop offset="70%" stop-color="#0891b2" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="20" stdDeviation="20" flood-color="#000000" flood-opacity="0.38"/>
+    </filter>
+  </defs>
+  <rect width="100%" height="100%" fill="#020617"/>
+  <rect x="24" y="24" width="1552" height="942" rx="24" fill="url(#bg)" stroke="#1f2937" filter="url(#shadow)"/>
+  <rect x="24" y="24" width="1552" height="942" rx="24" fill="url(#glow)"/>
+  <circle cx="64" cy="60" r="8" fill="#fb7185"/>
+  <circle cx="94" cy="60" r="8" fill="#facc15"/>
+  <circle cx="124" cy="60" r="8" fill="#34d399"/>
+  <text x="156" y="69" fill="#f8fafc" font-size="26" font-weight="750" font-family="Inter, Segoe UI, Arial, sans-serif">SGPU live dashboard</text>
+  <text x="1556" y="69" fill="#94a3b8" font-size="18" text-anchor="end" font-family="Inter, Segoe UI, Arial, sans-serif">H200 node visibility from kubectl</text>
+  <g font-family="Cascadia Mono, JetBrains Mono, Consolas, monospace" font-size="22" xml:space="preserve">
+    <text x="44" y="108" fill="#67e8f9">SGPU  node=h200-04-w-4b11  driver=580.126.16  23:17:10 UTC (08:17 KST)</text><text x="44" y="140" fill="#d1d5db"></text><text x="44" y="172" fill="#f8fafc">GPU NAME      UTIL               MEM                        TEMP      POWER  OWNERS</text><text x="44" y="204" fill="#93c5fd">  0 H200      [████████░░]  82%  [██████░░░░] 78.6G/140.4G   54C   400/700W  atlas</text><text x="44" y="236" fill="#34d399">  1 H200      [░░░░░░░░░░]   0%  [░░░░░░░░░░] 0.6G/140.4G    31C    77/700W  -</text><text x="44" y="268" fill="#34d399">  2 H200      [░░░░░░░░░░]   0%  [░░░░░░░░░░] 0.6G/140.4G    30C    75/700W  -</text><text x="44" y="300" fill="#fb7185">  3 H200      [██████████]  99%  [████░░░░░░] 61.6G/140.4G   61C   558/700W  nova</text><text x="44" y="332" fill="#93c5fd">  4 H200      [████████░░]  76%  [█████░░░░░] 73.8G/140.4G   62C   391/700W  atlas</text><text x="44" y="364" fill="#93c5fd">  5 H200      [████████░░]  85%  [█████░░░░░] 70.7G/140.4G   54C   426/700W  atlas</text><text x="44" y="396" fill="#93c5fd">  6 H200      [█████░░░░░]  48%  [██████░░░░] 81.8G/140.4G   51C   321/700W  atlas</text><text x="44" y="428" fill="#34d399">  7 H200      [░░░░░░░░░░]   0%  [░░░░░░░░░░] 0.6G/140.4G    30C    78/700W  -</text><text x="44" y="460" fill="#d1d5db"></text><text x="44" y="492" fill="#c084fc">NVIDIA compute processes</text><text x="44" y="524" fill="#f8fafc">GPU  OWNER     POD                                             PID   SM%      MEM       UP  CMD</text><text x="44" y="556" fill="#93c5fd">  0  atlas     atlas-vla-train-a                             12034    74    77.8G   21h48m  python vla.py</text><text x="44" y="588" fill="#fde68a">  3  nova      nova-world-model-b                            12035    97    61.0G    1d20h  python wm.py</text><text x="44" y="620" fill="#93c5fd">  4  atlas     atlas-vla-train-a                             12036    72    73.1G   21h48m  python eval.py</text><text x="44" y="652" fill="#93c5fd">  5  atlas     atlas-vla-train-a                             12037    79    70.0G   21h48m  python cache.py</text><text x="44" y="684" fill="#93c5fd">  6  atlas     atlas-vla-train-a                             12038    58    81.1G   21h48m  python nb.py</text><text x="44" y="716" fill="#d1d5db"></text><text x="44" y="748" fill="#c084fc">Kubernetes GPU pods on this node</text><text x="44" y="780" fill="#f8fafc">OWNER     REQ  ACT  AGE      PHASE     POD</text><text x="44" y="812" fill="#fde68a">nova          1    1  1d20h    Running   nova-world-model-b</text><text x="44" y="844" fill="#93c5fd">atlas      4    4  21h48m   Running   atlas-vla-train-a</text><text x="44" y="876" fill="#d1d5db"></text><text x="44" y="908" fill="#c084fc">STORAGE pv-01/pv-02 [████████░░] 83.0%  34.8T/41.9T used, 7.1T free</text>
+  </g>
+</svg>

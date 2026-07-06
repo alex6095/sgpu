@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1480" height="382" viewBox="0 0 1480 382">
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#06101f"/>
+      <stop offset="48%" stop-color="#0b1220"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="18%" cy="0%" r="68%">
+      <stop offset="0%" stop-color="#0891b2" stop-opacity="0.28"/>
+      <stop offset="70%" stop-color="#0891b2" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="20" stdDeviation="20" flood-color="#000000" flood-opacity="0.38"/>
+    </filter>
+  </defs>
+  <rect width="100%" height="100%" fill="#020617"/>
+  <rect x="24" y="24" width="1432" height="334" rx="24" fill="url(#bg)" stroke="#1f2937" filter="url(#shadow)"/>
+  <rect x="24" y="24" width="1432" height="334" rx="24" fill="url(#glow)"/>
+  <circle cx="64" cy="60" r="8" fill="#fb7185"/>
+  <circle cx="94" cy="60" r="8" fill="#facc15"/>
+  <circle cx="124" cy="60" r="8" fill="#34d399"/>
+  <text x="156" y="69" fill="#f8fafc" font-size="26" font-weight="750" font-family="Inter, Segoe UI, Arial, sans-serif">Process to pod attribution</text>
+  <text x="1436" y="69" fill="#94a3b8" font-size="18" text-anchor="end" font-family="Inter, Segoe UI, Arial, sans-serif">owners, pods, PIDs, memory and uptime</text>
+  <g font-family="Cascadia Mono, JetBrains Mono, Consolas, monospace" font-size="22" xml:space="preserve">
+    <text x="44" y="108" fill="#c084fc">NVIDIA compute processes</text><text x="44" y="140" fill="#f8fafc">GPU  OWNER     POD                                             PID   SM%      MEM       UP  CMD</text><text x="44" y="172" fill="#93c5fd">  0  atlas     atlas-vla-train-a                             12034    75    77.8G   21h48m  python vla.py</text><text x="44" y="204" fill="#fde68a">  3  nova      nova-world-model-b                            12035    96    61.0G    1d20h  python wm.py</text><text x="44" y="236" fill="#93c5fd">  4  atlas     atlas-vla-train-a                             12036    86    73.1G   21h48m  python eval.py</text><text x="44" y="268" fill="#93c5fd">  5  atlas     atlas-vla-train-a                             12037    78    70.0G   21h48m  python cache.py</text><text x="44" y="300" fill="#93c5fd">  6  atlas     atlas-vla-train-a                             12038    56    81.1G   21h48m  python nb.py</text>
+  </g>
+</svg>
