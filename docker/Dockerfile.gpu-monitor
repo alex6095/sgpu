@@ -3,7 +3,8 @@ FROM nvidia/cuda:12.8.1-base-ubuntu24.04
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    LANG=C.UTF-8
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -26,8 +27,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gpustat \
     nvitop \
     nvidia-ml-py \
+    pyyaml \
     && rm -rf /var/lib/apt/lists/* /tmp/nvidia-utils /tmp/nvidia-utils-extract
 
-COPY tools/gpu-monitor/server.py /opt/gpu-monitor/server.py
+COPY tools/gpu-monitor/ /opt/gpu-monitor/
 
 CMD ["tini", "--", "python3", "/opt/gpu-monitor/server.py"]

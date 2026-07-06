@@ -29,9 +29,28 @@ spec:
     - name: sangmin-ncr-pull
   nodeSelector:
     mlx.navercorp.com/zone: private-h200-sgvr-0
+  volumes:
+    # Usage-stats storage. Survives pod restarts on the same node.
+    # If your cluster's admission policy rejects hostPath, replace with:
+    #   - name: sgpu-data
+    #     emptyDir: {}
+    # (stats history is then lost whenever the pod is recreated)
+    - name: sgpu-data
+      hostPath:
+        path: /var/lib/sgpu
+        type: DirectoryOrCreate
+    # Optional: lets the server list pods (allocated-vs-used view + stats).
+    # Create AFTER deploying, no pod restart needed:
+    #   kubectl -n p-sgvr-node-02 create secret generic sgpu-kubeconfig \
+    #     --from-file=config=$HOME/.kube/config
+    # SECURITY: anyone with exec access to this pod can read that token.
+    - name: sgpu-kubeconfig
+      secret:
+        secretName: sgpu-kubeconfig
+        optional: true
   containers:
     - name: monitor
-      image: vnxb4cz3.kr.private-ncr.ntruss.com/sangmin/gpu-monitor:nvml-580.126.16-v4
+      image: vnxb4cz3.kr.private-ncr.ntruss.com/sangmin/gpu-monitor:nvml-580.126.16-v5
       imagePullPolicy: Always
       securityContext:
         privileged: true
@@ -48,6 +67,12 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
+        - name: KUBECONFIG
+          value: /etc/sgpu/kubeconfig/config
+        - name: SGPU_DATA_DIR
+          value: /var/lib/sgpu
+        - name: SGPU_SAMPLE_INTERVAL
+          value: "15"
       command:
         - tini
         - --
@@ -55,6 +80,12 @@ spec:
         - /opt/gpu-monitor/server.py
       ports:
         - containerPort: 8080
+      volumeMounts:
+        - name: sgpu-data
+          mountPath: /var/lib/sgpu
+        - name: sgpu-kubeconfig
+          mountPath: /etc/sgpu/kubeconfig
+          readOnly: true
       resources:
         requests:
           cpu: "250m"
