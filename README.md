@@ -30,7 +30,9 @@ sgpu watch [sec]   dumb-terminal loop   sgpu nvitop        raw nvitop
 sgpu pods|smi|gpustat|json|health|version|--help
 ```
 
-TUI keys: `j/k` scroll · `Tab` pane · `s` sort · `o` owner filter · `p` pause · `q` quit.
+TUI keys: `j/k` scroll · `Tab` pane · `s` sort · `o` owner filter · `p` pause ·
+`t` **stats screen** (GitHub-style activity grid; `h/d/w/m` or `a` switches the
+time axis hour/day/week/month, `r` refetch) · `q` quit.
 Options: `-n` namespace, `--pod`, `-r` refresh, `--no-color`. Env: `SGPU_NAMESPACE`, `SGPU_POD`.
 
 ### Zero-install (kubectl only)

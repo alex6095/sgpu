@@ -50,7 +50,7 @@ spec:
         optional: true
   containers:
     - name: monitor
-      image: vnxb4cz3.kr.private-ncr.ntruss.com/sangmin/gpu-monitor:nvml-580.126.16-v6
+      image: vnxb4cz3.kr.private-ncr.ntruss.com/sangmin/gpu-monitor:nvml-580.126.16-v7
       imagePullPolicy: Always
       securityContext:
         privileged: true
