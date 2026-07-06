@@ -1,17 +1,4 @@
 apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: sgpu-data
-  namespace: p-sgvr-node-02
-spec:
-  storageClassName: local-path
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 5Gi
----
-apiVersion: v1
 kind: Service
 metadata:
   name: sangmin-gpu-monitor
@@ -43,13 +30,15 @@ spec:
   nodeSelector:
     mlx.navercorp.com/zone: private-h200-sgvr-0
   volumes:
-    # Usage-stats storage. local-path PVC = node-local, survives pod
-    # restarts. (hostPath is denied by the cluster's kyverno policy;
-    # if PVCs are unavailable in your namespace, fall back to
-    # `emptyDir: {}` and accept losing history on pod recreation.)
+    # Usage-stats storage lives on the lab's shared persistent volume
+    # (pv-01), under this user's own subdirectory. subPath keeps the
+    # privileged pod scoped to its own stats dir, not the whole 24 TB
+    # volume. pv-01 is a node-local (local-path) PV, so its nodeAffinity
+    # co-schedules this pod onto the node where the GPUs it monitors live.
+    # (hostPath is denied by the cluster's kyverno policy.)
     - name: sgpu-data
       persistentVolumeClaim:
-        claimName: sgpu-data
+        claimName: pv-01
     # Optional: lets the server list pods (allocated-vs-used view + stats).
     # Create AFTER deploying, no pod restart needed:
     #   kubectl -n p-sgvr-node-02 create secret generic sgpu-kubeconfig \
@@ -94,6 +83,7 @@ spec:
       volumeMounts:
         - name: sgpu-data
           mountPath: /var/lib/sgpu
+          subPath: sangmin/sgpu
         - name: sgpu-kubeconfig
           mountPath: /etc/sgpu/kubeconfig
           readOnly: true

@@ -97,9 +97,20 @@ GPU-requesting pod every 15 seconds, around the clock:
   activity heatmap.
 - **Raw export**: `/stats/raw?date=YYYYMMDD` (NDJSON) and `/stats/files`.
 
-Storage is a node-local PVC (`sgpu-data`, storage class `local-path`,
-mounted at `/var/lib/sgpu`), so history survives pod restarts. (`hostPath`
-is denied by the cluster's kyverno policy.)
+Storage is the lab's shared persistent volume `pv-01`, mounted at
+`/var/lib/sgpu` via `subPath: sangmin/sgpu` — so history lives alongside the
+rest of the lab's durable data and survives pod restarts. `subPath` keeps
+the privileged pod scoped to its own stats directory rather than the whole
+24 TB volume, and `pv-01`'s node affinity co-schedules the monitor onto the
+node whose GPUs it watches. (`hostPath` is denied by the cluster's kyverno
+policy; a dedicated `local-path` PVC works too but is one more artifact to
+manage.)
+
+Inspect the raw stats from any pod that mounts `pv-01`, e.g. the dind pod:
+
+```bash
+kubectl exec -n p-sgvr-node-02 sangmin-ulr-v2-dind-dev -c dev -- ls -la /pv-01/sangmin/sgpu
+```
 
 ## HTTP endpoints (inside the pod, `:8080`)
 
