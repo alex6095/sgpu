@@ -1,0 +1,33 @@
+FROM nvidia/cuda:12.8.1-base-ubuntu24.04
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    libnvidia-cfg1-580=580.126.16-1ubuntu1 \
+    libnvidia-common-580=580.126.16-1ubuntu1 \
+    libnvidia-compute-580=580.126.16-1ubuntu1 \
+    libnvidia-decode-580=580.126.16-1ubuntu1 \
+    libnvidia-gpucomp-580=580.126.16-1ubuntu1 \
+    python3 \
+    python3-pip \
+    procps \
+    tini \
+    && mkdir -p /tmp/nvidia-utils /tmp/nvidia-utils-extract \
+    && cd /tmp/nvidia-utils \
+    && apt-get download nvidia-utils-580=580.65.06-0ubuntu1 \
+    && dpkg-deb -x nvidia-utils-580_580.65.06-0ubuntu1_amd64.deb /tmp/nvidia-utils-extract \
+    && install -m 0755 /tmp/nvidia-utils-extract/usr/bin/nvidia-smi /usr/bin/nvidia-smi \
+    && python3 -m pip install --break-system-packages --no-cache-dir \
+    gpustat \
+    nvitop \
+    nvidia-ml-py \
+    && rm -rf /var/lib/apt/lists/* /tmp/nvidia-utils /tmp/nvidia-utils-extract
+
+COPY tools/gpu-monitor/server.py /opt/gpu-monitor/server.py
+
+CMD ["tini", "--", "python3", "/opt/gpu-monitor/server.py"]

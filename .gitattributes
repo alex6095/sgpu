@@ -1,0 +1,14 @@
+# Default: normalize text, let Git pick native line endings on checkout.
+* text=auto
+
+# Files consumed by Linux/WSL/containers must stay LF or they break.
+bin/sgpu           text eol=lf
+*.sh               text eol=lf
+*.py               text eol=lf
+*.yaml             text eol=lf
+*.yml              text eol=lf
+Dockerfile*        text eol=lf
+
+# Windows-only scripts: keep CRLF.
+*.ps1              text eol=crlf
+*.cmd              text eol=crlf
