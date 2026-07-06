@@ -1,54 +1,161 @@
-# sgpu
+# SGPU
 
-`sgpu` is a small local command for checking MLXP H200 GPU status before you
-decide whether to launch a GPU pod.
+**SGVR GPU** / **S**imple **GPU** monitor — a zero-fuss way to check the
+MLXP H200 GPU nodes before you decide whether to launch a pod.
 
-It hides the noisy parts:
+- **Zero-install**: anyone with `kubectl` gets the full dashboard and TUI.
+- **Who is using what**: every GPU process is attributed to its Kubernetes
+  pod and owner (`yoonki-ume-...` → `yoonki`), including `nvitop`-style bars.
+- **Usage accounting**: per-owner GPU-hours, utilization, memory efficiency,
+  idle-allocation warnings and a KST time-of-day heatmap, recorded 24/7.
+- The monitor pod is read-only and requests **no GPU** (CPU/memory only).
 
-- uses `kubectl exec` by default, so no local port-forward is needed
-- can use an optional `kubectl port-forward` tunnel when you want lower-latency HTTP access
-- shows a live terminal dashboard
-- combines `nvidia-smi` process rows with Kubernetes pod owner/age/GPU request
-- does not require a GPU allocation for the monitor pod
+## Zero-install usage (kubectl only)
 
-The monitor pod is still read-only. It requests CPU/memory only.
+No install needed — these work for every lab member as-is:
 
-## Requirements
+```bash
+# Interactive TUI (scroll, sort, owner filter — like nvitop, plus pod owners)
+kubectl exec -it -n p-sgvr-node-02 sangmin-gpu-monitor -- python3 /opt/gpu-monitor/tui.py
 
-Local machine:
+# One-shot dashboard
+kubectl exec -n p-sgvr-node-02 sangmin-gpu-monitor -- curl -fsS http://127.0.0.1:8080/table
 
-- `kubectl` configured for the MLXP namespace
-- access to namespace `p-sgvr-node-02`
-- Windows PowerShell 5+ or Linux/macOS Bash
-- Linux/macOS also needs `curl` and `python3`
+# Raw nvitop / nvidia-smi
+kubectl exec -it -n p-sgvr-node-02 sangmin-gpu-monitor -- nvitop
+kubectl exec -n p-sgvr-node-02 sangmin-gpu-monitor -- nvidia-smi
 
-Cluster side:
-
-- `sangmin-gpu-monitor` pod and service deployed from `k8s/gpu-monitor.yaml`
-- image `vnxb4cz3.kr.private-ncr.ntruss.com/sangmin/gpu-monitor:nvml-580.126.16-v4`
-
-## Windows Install
-
-From this folder:
-
-```powershell
-.\scripts\install-sgpu.ps1
+# Usage report (last 7 days)
+kubectl exec -n p-sgvr-node-02 sangmin-gpu-monitor -- curl -fsS "http://127.0.0.1:8080/stats?days=7"
 ```
 
-Open a new terminal, then:
+The `sgpu` command below is just a short wrapper around these.
+
+## Install the `sgpu` command
+
+Requirements: `kubectl` configured for the MLXP namespace (see
+[Linux / WSL kubectl setup](#linux--wsl-kubectl-setup) if starting fresh).
+
+**Windows** (PowerShell, from this repo):
 
 ```powershell
-sgpu once
-sgpu
+.\scripts\install-sgpu.ps1     # creates %USERPROFILE%\bin\sgpu.cmd
 ```
 
-The installer creates:
+**Linux / WSL / macOS**:
+
+```bash
+./scripts/install-sgpu.sh      # symlinks to ~/.local/bin/sgpu
+```
+
+## Commands
 
 ```text
-%USERPROFILE%\bin\sgpu.cmd
+sgpu               interactive TUI (default)
+sgpu once          one-shot dashboard
+sgpu watch [sec]   simple refresh loop (dumb terminals / CI)
+sgpu apps          GPU process table with pod owners
+sgpu stats [days]  per-owner usage report (default 7 days)
+sgpu nvitop        raw nvitop TUI
+sgpu pods          GPU-requesting pods (JSON)
+sgpu smi           raw nvidia-smi
+sgpu gpustat       gpustat output
+sgpu json          full snapshot (JSON, schema 2)
+sgpu health | version | help
 ```
 
-and adds `%USERPROFILE%\bin` to the user PATH if needed.
+Options (both platforms): namespace `-n/-Namespace`, pod `--pod/-Pod`,
+refresh `-r/-Refresh`, `--no-color/-NoColor`. Env vars: `SGPU_NAMESPACE`,
+`SGPU_POD`.
+
+### TUI keys
+
+```text
+j/k or ↑/↓   scroll        Tab   switch pane (processes / pods)
+PgUp/PgDn    page          s     cycle sort (gpu / mem / owner)
+g/G          top/bottom    o     cycle owner filter
+p            pause         r     force refresh
+q            quit
+```
+
+The refresh loop runs **inside the pod**, so the TUI is smooth from any
+client — there is no per-frame kubectl round trip.
+
+## Usage statistics
+
+The monitor samples every GPU, process (with pod/owner attribution) and
+GPU-requesting pod every 15 seconds, around the clock:
+
+- **Raw samples**: `samples-YYYYMMDD.jsonl` (UTC days) — full fidelity
+  (util, SM% per process, memory, power, temperature, pod allocation), so
+  future analysis tools can recompute any statistic from raw data.
+  Yesterday's file is gzipped and summarized into `rollup-YYYYMMDD.json`
+  on rollover. Retention 365 days, total size capped at 2 GB.
+- **Report** (`sgpu stats [days]`): per-owner leaderboard (GPU-hours,
+  average SM%/util, peak memory, allocated-vs-idle hours), low-utilization
+  warnings, pods that hold GPUs idle right now, and a KST hour-of-day
+  activity heatmap.
+- **Raw export**: `/stats/raw?date=YYYYMMDD` (NDJSON) and `/stats/files`.
+
+Storage is a `hostPath` on the node (`/var/lib/sgpu`), so history survives
+pod restarts.
+
+## HTTP endpoints (inside the pod, `:8080`)
+
+```text
+/table   dashboard (plain by default; ?color=1, ?cols=N, ?ascii=1)
+/apps    process table          /pods    pods JSON
+/json    snapshot (schema 2)    /stats   usage report (?days=N&format=json)
+/smi /topo /gpustat /health /version /stats/files /stats/raw?date=
+```
+
+## Deploy / operate the monitor pod
+
+```bash
+# Build + push the image (needs NCR login)
+docker build -f docker/Dockerfile.gpu-monitor -t vnxb4cz3.kr.private-ncr.ntruss.com/sangmin/gpu-monitor:nvml-580.126.16-v5 .
+docker push vnxb4cz3.kr.private-ncr.ntruss.com/sangmin/gpu-monitor:nvml-580.126.16-v5
+
+# Pods are immutable — recreate to roll out
+kubectl delete pod sangmin-gpu-monitor -n p-sgvr-node-02 --ignore-not-found
+kubectl apply -f k8s/gpu-monitor.yaml
+kubectl wait --for=condition=Ready pod/sangmin-gpu-monitor -n p-sgvr-node-02 --timeout=180s
+```
+
+### Enable the pod-allocation view (recommended, one command)
+
+The pod's own service account cannot list pods (403), so out of the box the
+dashboard attributes only *running processes*. To also see **allocated
+pods** (including "holds GPUs but runs nothing"), give the server a
+kubeconfig:
+
+```bash
+kubectl -n p-sgvr-node-02 create secret generic sgpu-kubeconfig \
+  --from-file=config=$HOME/.kube/config
+```
+
+No pod restart needed — kubelet syncs the optional secret within a minute.
+
+> **Security note**: anyone with `exec` access to the monitor pod can read
+> that token. This is acceptable inside a trusting lab namespace; use the
+> least-privileged kubeconfig you have.
+
+## How it works
+
+```text
+┌─ your machine ──────────┐   ┌─ monitor pod (privileged, hostPID, no GPU req) ─┐
+│ sgpu  (thin wrapper)    │   │ server.py: NVML snapshots + /proc attribution   │
+│  └─ kubectl exec ──────────▶│   ├─ /table /json /stats ... (renders ANSI)     │
+│  └─ kubectl exec -it ──────▶│ tui.py (curses, reads local /json)              │
+└─────────────────────────┘   │ statsdb: 15s JSONL samples → rollups (hostPath) │
+                              └──────────────────────────────────────────────────┘
+```
+
+Process → pod attribution reads `/proc/<pid>/environ` (`HOSTNAME` is the pod
+name; hostPID makes GPU PIDs visible), with a cgroup-UID fallback. The owner
+is the pod-name prefix before the first `-`/`_`. Known limits: pods that
+override `spec.hostname`, and MPS-shared contexts, may attribute to `?` or
+to the MPS server pod.
 
 ## Linux / WSL kubectl setup
 
@@ -59,11 +166,10 @@ mkdir -p ~/.local/bin
 V=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
 curl -fsSL -o ~/.local/bin/kubectl "https://dl.k8s.io/release/${V}/bin/linux/amd64/kubectl"
 chmod +x ~/.local/bin/kubectl
-# ~/.local/bin is on PATH by default in Ubuntu login shells.
 ```
 
-Install the kubeconfig (the file already contains a bearer token, so no extra
-login is needed):
+Install the kubeconfig (the file already contains a bearer token, so no
+extra login is needed):
 
 ```bash
 mkdir -p ~/.kube
@@ -74,209 +180,21 @@ kubectl get pods -n p-sgvr-node-02   # connectivity test
 
 In WSL, the Windows Downloads path is `/mnt/c/Users/<you>/Downloads/...`.
 
-## Linux Install
-
-From this folder:
+## Development
 
 ```bash
-chmod +x ./scripts/install-sgpu.sh ./bin/sgpu
-./scripts/install-sgpu.sh
+# Everything runs without a GPU in mock mode:
+SGPU_MOCK=1 python3 tools/gpu-monitor/server.py    # then curl :8080/table
+SGPU_MOCK=1 python3 tools/gpu-monitor/tui.py
+python3 -m unittest discover -s tests              # stats pipeline tests
 ```
 
-If `~/.local/bin` is not on PATH:
+## Troubleshooting
 
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-Then:
-
-```bash
-sgpu once
-sgpu
-```
-
-## Commands
-
-```text
-sgpu          live dashboard
-sgpu once     one-shot dashboard
-sgpu smi      raw nvidia-smi
-sgpu apps     process and pod owner view
-sgpu gpustat  gpustat text output
-sgpu url      local URLs
-sgpu status   local tunnel status
-sgpu stop     stop local kubectl port-forward
-```
-
-Refresh interval:
-
-```powershell
-sgpu -Refresh 1
-sgpu top 1
-sgpu once -Refresh 5
-```
-
-Linux:
-
-```bash
-sgpu -r 1
-sgpu top 1
-SGPU_INTERVAL=5 sgpu once
-```
-
-Transport:
-
-```powershell
-# Default: no local tunnel.
-sgpu
-sgpu once
-
-# Optional faster local HTTP tunnel.
-sgpu -UsePortForward
-sgpu once -UsePortForward
-sgpu stop
-```
-
-Linux:
-
-```bash
-# Default: no local tunnel.
-sgpu
-sgpu once
-
-# Optional faster local HTTP tunnel.
-sgpu --port-forward
-SGPU_TRANSPORT=port-forward sgpu once
-sgpu stop
-```
-
-Local URLs are available only when port-forward transport is selected:
-
-```text
-http://127.0.0.1:18080/table
-http://127.0.0.1:18080/smi
-http://127.0.0.1:18080/apps
-```
-
-## Smooth Rendering
-
-The live dashboard does not call `clear` on every refresh. It uses ANSI cursor
-movement, hides the cursor, writes into the terminal alternate screen, and
-clears each physical line before rewriting it. Long lines are clipped to the
-current terminal width to avoid automatic wrapping. It also avoids writing a
-final newline at the bottom row, which prevents one-frame terminal scroll
-artifacts. This avoids the heavy flicker and overlap artifacts from full-screen
-clears in Windows Terminal and WSL terminals.
-
-## Configuration
-
-Windows options:
-
-```powershell
-sgpu once -Namespace p-sgvr-node-02 -Service sangmin-gpu-monitor -Port 18080
-sgpu top -Refresh 1
-sgpu top -UsePortForward -Refresh 1
-```
-
-Linux environment variables:
-
-```bash
-SGPU_NAMESPACE=p-sgvr-node-02
-SGPU_SERVICE=sangmin-gpu-monitor
-SGPU_PORT=18080
-SGPU_INTERVAL=2
-```
-
-## LAN Sharing
-
-Default binding is local-only:
-
-```text
-127.0.0.1:18080
-```
-
-For a trusted network only:
-
-```powershell
-sgpu top -UsePortForward -ShareOnLan
-```
-
-or on Linux:
-
-```bash
-SGPU_TRANSPORT=port-forward SGPU_SHARE_ON_LAN=1 sgpu
-```
-
-This binds the local port-forward to `0.0.0.0`. Firewall and network routing
-still apply.
-
-## Deploy Monitor Pod
-
-If the monitor pod is missing:
-
-```powershell
-kubectl apply -f .\k8s\gpu-monitor.yaml
-kubectl wait --for=condition=Ready pod/sangmin-gpu-monitor -n p-sgvr-node-02 --timeout=180s
-```
-
-Check that it does not reserve a GPU:
-
-```powershell
-kubectl get pod sangmin-gpu-monitor -n p-sgvr-node-02 -o jsonpath="{.spec.containers[0].resources.requests}"
-```
-
-Expected request does not include `nvidia.com/gpu`.
-
-## No Install Kubectl Usage
-
-Anyone with `kubectl` access can use the monitor pod without installing `sgpu`.
-
-One-shot compact table:
-
-```bash
-kubectl exec -n p-sgvr-node-02 sangmin-gpu-monitor -- \
-  bash -lc 'curl -fsS http://127.0.0.1:8080/table'
-```
-
-Raw `nvidia-smi`:
-
-```bash
-kubectl exec -n p-sgvr-node-02 sangmin-gpu-monitor -- nvidia-smi
-```
-
-Processes:
-
-```bash
-kubectl exec -n p-sgvr-node-02 sangmin-gpu-monitor -- \
-  bash -lc 'curl -fsS http://127.0.0.1:8080/apps'
-```
-
-Linux live view without installing `sgpu`:
-
-```bash
-watch -n 2 "kubectl exec -n p-sgvr-node-02 sangmin-gpu-monitor -- bash -lc 'curl -fsS http://127.0.0.1:8080/table'"
-```
-
-Windows PowerShell live view without installing `sgpu`:
-
-```powershell
-while ($true) {
-  Clear-Host
-  kubectl exec -n p-sgvr-node-02 sangmin-gpu-monitor -- bash -lc 'curl -fsS http://127.0.0.1:8080/table'
-  Start-Sleep -Seconds 2
-}
-```
-
-The no-install commands show the monitor container view. `sgpu` adds the local
-`kubectl get pods` owner/age table on top.
-
-## Notes
-
-- `kubectl port-forward` is not treated as a permanent daemon. `sgpu` health
-  checks it and recreates it when needed, but only when port-forward transport
-  is explicitly selected.
-- The monitor pod uses `hostPID: true` so `nvidia-smi` can show compute PIDs.
-- Kubernetes pod owner/age/GPU request rows are added by the local `sgpu`
-  command using your local `kubectl` permission.
-- The owner column is inferred from the pod name prefix before `-` or `_`.
+- **Terminal looks broken after the TUI** (dropped connection): run `reset`.
+- **TUI frozen**: long `kubectl exec` sessions can be cut by load balancers —
+  just rerun `sgpu`.
+- **Garbled box characters on Windows**: use Windows Terminal, or add
+  `?ascii=1` / use `sgpu once -NoColor`.
+- **`pod allocation view disabled`** in the dashboard: create the
+  `sgpu-kubeconfig` secret (see above).
