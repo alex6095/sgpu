@@ -50,6 +50,30 @@ The installer creates:
 
 and adds `%USERPROFILE%\bin` to the user PATH if needed.
 
+## Linux / WSL kubectl setup
+
+If the machine does not have `kubectl` yet (fresh WSL Ubuntu, for example):
+
+```bash
+mkdir -p ~/.local/bin
+V=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+curl -fsSL -o ~/.local/bin/kubectl "https://dl.k8s.io/release/${V}/bin/linux/amd64/kubectl"
+chmod +x ~/.local/bin/kubectl
+# ~/.local/bin is on PATH by default in Ubuntu login shells.
+```
+
+Install the kubeconfig (the file already contains a bearer token, so no extra
+login is needed):
+
+```bash
+mkdir -p ~/.kube
+cp /path/to/sgvr-node-02-kubeconfig.yaml ~/.kube/config
+chmod 600 ~/.kube/config
+kubectl get pods -n p-sgvr-node-02   # connectivity test
+```
+
+In WSL, the Windows Downloads path is `/mnt/c/Users/<you>/Downloads/...`.
+
 ## Linux Install
 
 From this folder:
