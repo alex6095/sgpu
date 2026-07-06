@@ -321,5 +321,393 @@ class TestQueryAndRender(unittest.TestCase):
             self.assertIn("2026-07-06T00:00:00Z", lines[0])
 
 
+class TestDailySeries(unittest.TestCase):
+    """query() returns a per-day series (oldest->newest) reusing rollups."""
+
+    def test_daily_series_two_days(self):
+        now = datetime(2026, 7, 7, 12, 0, 0, tzinfo=timezone.utc)
+        # yesterday: owner "a" only; today: owners "a" and "b".
+        y = "20260706"
+        t = "20260707"
+        ybase = int(datetime(2026, 7, 6, 1, 0, 0,
+                             tzinfo=timezone.utc).timestamp())
+        tbase = int(datetime(2026, 7, 7, 1, 0, 0,
+                             tzinfo=timezone.utc).timestamp())
+        yrecs = [sample(ts_at(ybase, i * 15), gpus=[gpu(0, 50)],
+                        procs=[proc(1, 0, "a")]) for i in range(4)]
+        trecs = []
+        for i in range(4):
+            trecs.append(sample(ts_at(tbase, i * 15),
+                                gpus=[gpu(0, 50), gpu(1, 50)],
+                                procs=[proc(1, 0, "a"), proc(2, 1, "b")]))
+        with tempfile.TemporaryDirectory() as d:
+            write_day(d, y, yrecs)
+            write_day(d, t, trecs)
+            result = statsagg.query(d, days=2, now_fn=lambda: now)
+
+        daily = result["daily"]
+        self.assertEqual([e["date"] for e in daily], [y, t])  # oldest->newest
+        # day1 only has "a"; day2 has "a" and "b".
+        self.assertIn("a", daily[0]["owners"])
+        self.assertNotIn("b", daily[0]["owners"])
+        self.assertIn("a", daily[1]["owners"])
+        self.assertIn("b", daily[1]["owners"])
+        # gpu_seconds sums match the merged per-owner totals.
+        merged = result["merged"]["owners"]
+        a_daily = sum(e["owners"].get("a", 0.0) for e in daily)
+        self.assertAlmostEqual(a_daily, merged["a"]["gpu_seconds"], places=6)
+        b_daily = sum(e["owners"].get("b", 0.0) for e in daily)
+        self.assertAlmostEqual(b_daily, merged["b"]["gpu_seconds"], places=6)
+        # coverage_seconds present and positive per day.
+        for e in daily:
+            self.assertGreater(e["coverage_seconds"], 0.0)
+
+    def test_daily_owner_filter(self):
+        now = datetime(2026, 7, 7, 12, 0, 0, tzinfo=timezone.utc)
+        tbase = int(datetime(2026, 7, 7, 1, 0, 0,
+                             tzinfo=timezone.utc).timestamp())
+        recs = [sample(ts_at(tbase, i * 15), gpus=[gpu(0, 50), gpu(1, 50)],
+                       procs=[proc(1, 0, "a"), proc(2, 1, "b")])
+                for i in range(4)]
+        with tempfile.TemporaryDirectory() as d:
+            write_day(d, "20260707", recs)
+            result = statsagg.query(d, days=1, owner="a", now_fn=lambda: now)
+        # daily owners restricted to "a" only.
+        for e in result["daily"]:
+            self.assertEqual(list(e["owners"].keys()), ["a"])
+
+    def test_query_backward_compatible_keys(self):
+        now = datetime(2026, 7, 7, 12, 0, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as d:
+            result = statsagg.query(d, days=7, now_fn=lambda: now)
+        for k in ("window_days", "dates_covered", "merged", "current_idle",
+                  "generated_utc", "daily"):
+            self.assertIn(k, result)
+
+
+class TestGrassBucketing(unittest.TestCase):
+    def test_bucket_levels(self):
+        # row max maps to top level (5); zero maps to empty (0).
+        self.assertEqual(statsagg._bucket_level(0.0, 100.0, 5), 0)
+        self.assertEqual(statsagg._bucket_level(100.0, 100.0, 5), 5)
+        # tiny positive -> level 1 (never skips to 0).
+        self.assertEqual(statsagg._bucket_level(0.01, 100.0, 5), 1)
+        # mid maps into 1..5.
+        self.assertTrue(1 <= statsagg._bucket_level(50.0, 100.0, 5) <= 5)
+        # mx == 0 -> level 0 regardless.
+        self.assertEqual(statsagg._bucket_level(5.0, 0.0, 5), 0)
+
+    def test_grass_present_only_when_two_dates(self):
+        # one date -> no calendar.
+        now = datetime(2026, 7, 7, 12, 0, 0, tzinfo=timezone.utc)
+        tbase = int(datetime(2026, 7, 7, 1, 0, 0,
+                             tzinfo=timezone.utc).timestamp())
+        recs = [sample(ts_at(tbase, i * 15), gpus=[gpu(0, 50)],
+                       procs=[proc(1, 0, "a")]) for i in range(4)]
+        with tempfile.TemporaryDirectory() as d:
+            write_day(d, "20260707", recs)
+            result = statsagg.query(d, days=1, now_fn=lambda: now)
+        text = statsagg.render_stats_text(result)
+        self.assertNotIn("Daily activity", text)
+
+    def test_grass_renders_with_two_dates(self):
+        now = datetime(2026, 7, 7, 12, 0, 0, tzinfo=timezone.utc)
+        ybase = int(datetime(2026, 7, 6, 1, 0, 0,
+                             tzinfo=timezone.utc).timestamp())
+        tbase = int(datetime(2026, 7, 7, 1, 0, 0,
+                             tzinfo=timezone.utc).timestamp())
+        yrecs = [sample(ts_at(ybase, i * 15), gpus=[gpu(0, 50)],
+                        procs=[proc(1, 0, "a")]) for i in range(4)]
+        trecs = [sample(ts_at(tbase, i * 15), gpus=[gpu(0, 50)],
+                        procs=[proc(1, 0, "a")]) for i in range(4)]
+        with tempfile.TemporaryDirectory() as d:
+            write_day(d, "20260706", yrecs)
+            write_day(d, "20260707", trecs)
+            result = statsagg.query(d, days=2, now_fn=lambda: now)
+        text = statsagg.render_stats_text(result, unicode_ok=True)
+        self.assertIn("Daily activity", text)
+        self.assertIn("less", text)  # legend
+
+    def test_grass_fills_gap_dates_as_empty(self):
+        # Data on 07-01 and 07-07 only; calendar spans all 7 dates, gaps empty.
+        now = datetime(2026, 7, 7, 12, 0, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as d:
+            for date_str in ("20260701", "20260707"):
+                base = int(datetime(2026, int(date_str[4:6]),
+                                    int(date_str[6:8]), 1, 0, 0,
+                                    tzinfo=timezone.utc).timestamp())
+                recs = [sample(ts_at(base, i * 15), gpus=[gpu(0, 50)],
+                               procs=[proc(1, 0, "a")]) for i in range(4)]
+                write_day(d, date_str, recs)
+            result = statsagg.query(d, days=7, now_fn=lambda: now)
+        # only two data dates, but calendar spans 7 contiguous dates.
+        self.assertEqual(len(result["daily"]), 2)
+        text = statsagg.render_stats_text(result, width=110, unicode_ok=True)
+        lines = text.splitlines()
+        start = lines.index("Daily activity")
+        row = None
+        for l in lines[start:]:
+            if l.startswith("a "):
+                row = l
+                break
+        self.assertIsNotNone(row)
+        # 7 cells x 2 chars = 14 cols of cells after the label(width=8)+space.
+        cells = row[9:]  # ow=8 label + 1 space
+        self.assertEqual(len(cells), 14)  # 7 dates -> 14 columns
+        # first and last cells filled; middle empty (spaces).
+        self.assertNotEqual(cells[0:2], "  ")   # 07-01 has data
+        self.assertNotEqual(cells[12:14], "  ")  # 07-07 has data
+        self.assertEqual(cells[2:12], " " * 10)  # 5 gap days empty
+
+    def test_grass_width_bound_and_truncation(self):
+        # Many dates, narrow width -> most-recent kept, '…' prefix, within width.
+        now = datetime(2026, 7, 7, 12, 0, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as d:
+            for back in range(14):
+                dd = now.date().fromordinal(now.date().toordinal() - back)
+                base = int(datetime(dd.year, dd.month, dd.day, 1, 0, 0,
+                                    tzinfo=timezone.utc).timestamp())
+                recs = [sample(ts_at(base, i * 15), gpus=[gpu(0, 50)],
+                               procs=[proc(1, 0, "a")]) for i in range(4)]
+                write_day(d, dd.strftime("%Y%m%d"), recs)
+            result = statsagg.query(d, days=14, now_fn=lambda: now)
+        width = 30
+        text = statsagg.render_stats_text(result, width=width, unicode_ok=True)
+        # isolate the "Daily activity" section (up to the next blank line).
+        all_lines = text.splitlines()
+        start = all_lines.index("Daily activity")
+        section = []
+        for l in all_lines[start:]:
+            if l == "" and section:
+                break
+            section.append(l)
+        # the grass owner/total rows are those containing a grass glyph.
+        grass_lines = [l for l in section
+                       if any(g in l for g in "…░▒▓█") or l.strip() == "TOTAL"]
+        self.assertTrue(grass_lines)
+        for l in grass_lines:
+            self.assertLessEqual(len(l), width)
+        self.assertIn("…", text)  # truncation marker present
+
+
+class TestPluralFix(unittest.TestCase):
+    def test_singular_one_day(self):
+        now = datetime(2026, 7, 7, 12, 0, 0, tzinfo=timezone.utc)
+        tbase = int(datetime(2026, 7, 7, 1, 0, 0,
+                             tzinfo=timezone.utc).timestamp())
+        recs = [sample(ts_at(tbase, i * 15), gpus=[gpu(0, 50)],
+                       procs=[proc(1, 0, "a")]) for i in range(4)]
+        with tempfile.TemporaryDirectory() as d:
+            write_day(d, "20260707", recs)
+            result = statsagg.query(d, days=1, now_fn=lambda: now)
+        text = statsagg.render_stats_text(result)
+        # subtitle uses singular "1 day" (bug fix); title keeps "last N days".
+        self.assertIn("data: 1 day,", text)
+        self.assertNotIn("data: 1 days", text)
+
+    def test_plural_two_days(self):
+        now = datetime(2026, 7, 7, 12, 0, 0, tzinfo=timezone.utc)
+        ybase = int(datetime(2026, 7, 6, 1, 0, 0,
+                             tzinfo=timezone.utc).timestamp())
+        tbase = int(datetime(2026, 7, 7, 1, 0, 0,
+                             tzinfo=timezone.utc).timestamp())
+        with tempfile.TemporaryDirectory() as d:
+            write_day(d, "20260706", [sample(ts_at(ybase, i * 15),
+                      gpus=[gpu(0, 50)], procs=[proc(1, 0, "a")])
+                      for i in range(4)])
+            write_day(d, "20260707", [sample(ts_at(tbase, i * 15),
+                      gpus=[gpu(0, 50)], procs=[proc(1, 0, "a")])
+                      for i in range(4)])
+            result = statsagg.query(d, days=2, now_fn=lambda: now)
+        text = statsagg.render_stats_text(result)
+        self.assertIn("data: 2 days,", text)
+
+
+def _acc(gpu_seconds=0.0, sm_wsum=0.0, sm_weight=0.0, util_wsum=0.0,
+         util_weight=0.0, mem_peak_mib=0, alloc_gpu_seconds=0.0,
+         idle_gpu_seconds=0.0, night_frac=0.0):
+    a = statsagg._empty_owner()
+    a["gpu_seconds"] = gpu_seconds
+    a["sm_wsum"] = sm_wsum
+    a["sm_weight"] = sm_weight
+    a["util_wsum"] = util_wsum
+    a["util_weight"] = util_weight
+    a["mem_peak_mib"] = mem_peak_mib
+    a["alloc_gpu_seconds"] = alloc_gpu_seconds
+    a["idle_gpu_seconds"] = idle_gpu_seconds
+    # spread activity: night_frac of gpu_seconds into KST hours 0-5.
+    hh = [0.0] * 24
+    hh[2] = gpu_seconds * night_frac
+    hh[14] = gpu_seconds * (1.0 - night_frac)
+    a["hour_hist_kst"] = hh
+    return a
+
+
+class TestAwards(unittest.TestCase):
+    def test_below_threshold_gets_no_award(self):
+        # single owner with < 1 GPU-h and low util: no best/power award.
+        owners = {"tiny": _acc(gpu_seconds=1800.0,  # 0.5 GPU-h
+                               sm_wsum=10 * 1800.0, sm_weight=1800.0)}
+        awards = statsagg._compute_awards(owners, pods_cov=0.0,
+                                          coverage_seconds=1800.0)
+        keys = [k for (k, _o, _t) in awards]
+        self.assertNotIn("best", keys)   # < 1 GPU-h
+        self.assertNotIn("power", keys)  # < 1 GPU-h
+        self.assertNotIn("sharp", keys)  # < 2 GPU-h
+
+    def test_best_requires_40pct_util(self):
+        # 10 GPU-h but util 30% -> not "best"; still "power".
+        owners = {"a": _acc(gpu_seconds=36000.0,
+                            sm_wsum=30 * 36000.0, sm_weight=36000.0)}
+        awards = dict((k, (o, t)) for (k, o, t) in
+                      statsagg._compute_awards(owners, 0.0, 36000.0))
+        self.assertNotIn("best", awards)
+        self.assertIn("power", awards)
+
+    def test_best_awarded_when_util_high(self):
+        owners = {"a": _acc(gpu_seconds=36000.0,   # 10 GPU-h
+                            sm_wsum=70 * 36000.0, sm_weight=36000.0,
+                            mem_peak_mib=60000)}
+        awards = dict((k, o) for (k, o, t) in
+                      statsagg._compute_awards(owners, 0.0, 36000.0))
+        self.assertEqual(awards.get("best"), "a")
+
+    def test_memory_threshold_32gib(self):
+        # memowner has the peak mem; other owner wins the compute awards so the
+        # 3-per-owner cap does not hide the mem award.
+        other = _acc(gpu_seconds=36000.0, sm_wsum=90 * 36000.0,
+                     sm_weight=36000.0)
+        # 30 GiB peak -> no mem award for anyone.
+        low = {"other": other,
+               "memowner": _acc(gpu_seconds=3600.0, sm_wsum=50 * 3600.0,
+                                sm_weight=3600.0, mem_peak_mib=30 * 1024)}
+        keys_low = [k for (k, _o, _t) in
+                    statsagg._compute_awards(low, 0.0, 39600.0)]
+        self.assertNotIn("mem", keys_low)
+        # 40 GiB peak -> mem awarded to memowner.
+        high = {"other": other,
+                "memowner": _acc(gpu_seconds=3600.0, sm_wsum=50 * 3600.0,
+                                 sm_weight=3600.0, mem_peak_mib=40 * 1024)}
+        awards = dict((k, o) for (k, o, _t) in
+                      statsagg._compute_awards(high, 0.0, 39600.0))
+        self.assertEqual(awards.get("mem"), "memowner")
+
+    def test_night_owl(self):
+        # "top" sweeps the compute awards; "owl" wins night by working 0-5 KST.
+        owners = {
+            "top": _acc(gpu_seconds=72000.0, sm_wsum=90 * 72000.0,
+                        sm_weight=72000.0, mem_peak_mib=80 * 1024,
+                        night_frac=0.1),
+            "owl": _acc(gpu_seconds=18000.0, sm_wsum=50 * 18000.0,
+                        sm_weight=18000.0, night_frac=0.9),
+        }
+        awards = dict((k, o) for (k, o, t) in
+                      statsagg._compute_awards(owners, 0.0, 90000.0))
+        self.assertEqual(awards.get("night"), "owl")
+
+    def test_headroom_kind_phrasing(self):
+        # >= 4 GPU-h, util < 40% -> headroom, kind phrasing.
+        owners = {"a": _acc(gpu_seconds=4 * 3600.0,
+                            util_wsum=22 * 4 * 3600.0,
+                            util_weight=4 * 3600.0)}
+        out = statsagg._compute_awards(owners, 0.0, 4 * 3600.0)
+        texts = {k: t for (k, o, t) in out}
+        self.assertIn("headroom", texts)
+        self.assertIn("free speedup waiting", texts["headroom"])
+
+    def test_seat_warmer_requires_pod_coverage(self):
+        # "top" sweeps compute awards; "idler" is the seat warmer.
+        owners = {
+            "top": _acc(gpu_seconds=72000.0, sm_wsum=90 * 72000.0,
+                        sm_weight=72000.0, mem_peak_mib=80 * 1024),
+            "idler": _acc(gpu_seconds=18000.0, sm_wsum=50 * 18000.0,
+                          sm_weight=18000.0, idle_gpu_seconds=3 * 3600.0),
+        }
+        # pods_cov below 0.5*coverage -> no seat award.
+        keys_no = [k for (k, _o, _t) in
+                   statsagg._compute_awards(owners, pods_cov=100.0,
+                                            coverage_seconds=90000.0)]
+        self.assertNotIn("seat", keys_no)
+        # strong pod coverage -> seat award to idler.
+        awards_yes = dict((k, o) for (k, o, _t) in
+                          statsagg._compute_awards(owners, pods_cov=60000.0,
+                                                   coverage_seconds=90000.0))
+        self.assertEqual(awards_yes.get("seat"), "idler")
+
+    def test_max_three_awards_per_owner(self):
+        # One dominant owner that would win 5 awards -> capped at 3.
+        owners = {
+            "star": _acc(gpu_seconds=36000.0, sm_wsum=90 * 36000.0,
+                         sm_weight=36000.0, mem_peak_mib=80 * 1024,
+                         night_frac=0.9),
+            "b": _acc(gpu_seconds=3600.0, sm_wsum=50 * 3600.0,
+                      sm_weight=3600.0, mem_peak_mib=1),
+        }
+        awards = statsagg._compute_awards(owners, 0.0, 36000.0)
+        star_count = sum(1 for (_k, o, _t) in awards if o == "star")
+        self.assertLessEqual(star_count, 3)
+        # The dropped ones are lowest priority (night dropped, best kept).
+        keys_for_star = [k for (k, o, _t) in awards if o == "star"]
+        self.assertIn("best", keys_for_star)
+
+    def test_empty_owners_no_crash(self):
+        self.assertEqual(statsagg._compute_awards({}, 0.0, 0.0), [])
+        # only the "?" owner -> excluded, no awards, no crash.
+        owners = {"?": _acc(gpu_seconds=36000.0, sm_wsum=70 * 36000.0,
+                            sm_weight=36000.0)}
+        self.assertEqual(statsagg._compute_awards(owners, 0.0, 36000.0), [])
+
+
+class TestUnicodeAsciiModes(unittest.TestCase):
+    def _two_day_result(self, d):
+        now = datetime(2026, 7, 7, 12, 0, 0, tzinfo=timezone.utc)
+        ybase = int(datetime(2026, 7, 6, 1, 0, 0,
+                             tzinfo=timezone.utc).timestamp())
+        tbase = int(datetime(2026, 7, 7, 1, 0, 0,
+                             tzinfo=timezone.utc).timestamp())
+        for date_str, base in (("20260706", ybase), ("20260707", tbase)):
+            recs = [sample(ts_at(base, i * 15),
+                           gpus=[gpu(0, 80)],
+                           procs=[proc(1, 0, "yoonki", sm=75, mem=60000)])
+                    for i in range(300)]
+            write_day(d, date_str, recs)
+        return statsagg.query(d, days=2, now_fn=lambda: now)
+
+    def test_unicode_false_no_emoji_no_ansi(self):
+        with tempfile.TemporaryDirectory() as d:
+            result = self._two_day_result(d)
+        text = statsagg.render_stats_text(result, color=False,
+                                          unicode_ok=False)
+        self.assertNotIn("\x1b", text)  # no ANSI
+        # no emoji code points anywhere.
+        for ch in text:
+            self.assertLess(ord(ch), 0x2500,
+                            msg="unexpected non-ascii glyph %r" % ch)
+        # ascii award tag used instead of emoji.
+        self.assertIn("[best]", text)
+        self.assertIn("[power]", text)
+
+    def test_unicode_true_has_emoji(self):
+        with tempfile.TemporaryDirectory() as d:
+            result = self._two_day_result(d)
+        text = statsagg.render_stats_text(result, color=False,
+                                          unicode_ok=True)
+        self.assertIn("🏆", text)
+
+    def test_color_true_has_ansi_backgrounds(self):
+        with tempfile.TemporaryDirectory() as d:
+            result = self._two_day_result(d)
+        text = statsagg.render_stats_text(result, color=True, unicode_ok=True)
+        self.assertIn("\x1b[48;5;", text)  # grass 256-color backgrounds
+        self.assertIn("\x1b[38;5;", text)  # heatmap 256-color foregrounds
+
+    def test_leaderboard_full_names(self):
+        # owner names longer than 3 chars must appear in full in the report.
+        with tempfile.TemporaryDirectory() as d:
+            result = self._two_day_result(d)
+        text = statsagg.render_stats_text(result, color=False)
+        self.assertIn("yoonki", text)  # not truncated to "yoo"
+
+
 if __name__ == "__main__":
     unittest.main()

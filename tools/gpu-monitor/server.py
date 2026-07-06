@@ -175,7 +175,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(200, result)
                 return
             self.send_body(200, statsagg.render_stats_text(
-                result, color=color, width=width))
+                result, color=color, width=width,
+                unicode_ok=(q("ascii") != "1")))
             return
         self.send_body(404, "not found\n")
 

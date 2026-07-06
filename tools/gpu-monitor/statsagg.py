@@ -30,6 +30,14 @@ KST_OFFSET_HOURS = 9
 NONE_OWNER = "?"
 SPARK = "▁▂▃▄▅▆▇█"  # ▁▂▃▄▅▆▇█
 
+# Calendar ("grass") cell glyphs, 5 levels (index 0 = empty).
+GRASS_UNICODE = " .░▒▓█"   # empty + . + 4 shades (level 5 uses █)
+GRASS_ASCII = " .-=*#"     # ascii fallback, same shape
+# 256-color backgrounds for the color grass: empty (dark gray) + green scale.
+GRASS_BG = ["238", "22", "28", "34", "40", "46"]
+# 256-color foregrounds for the heatmap spark gradient (5 intensity buckets).
+SPARK_FG = ["22", "28", "34", "40", "46"]
+
 # --- ANSI helpers -----------------------------------------------------------
 
 _ANSI = {
@@ -44,6 +52,16 @@ def _c(code, s, color):
     if not color or code not in _ANSI:
         return s
     return "\x1b[%sm%s\x1b[0m" % (_ANSI[code], s)
+
+
+def _bg256(code, s):
+    """Wrap s in a 256-color background, reset after."""
+    return "\x1b[48;5;%sm%s\x1b[0m" % (code, s)
+
+
+def _fg256(code, s):
+    """Wrap s in a 256-color foreground, reset after."""
+    return "\x1b[38;5;%sm%s\x1b[0m" % (code, s)
 
 
 # --- time parsing -----------------------------------------------------------
@@ -586,6 +604,7 @@ def query(data_dir, days=7, owner=None, now_fn=None):
 
     rollups = []
     dates_covered = []
+    daily = []
     for back in range(days - 1, -1, -1):
         d = today - timedelta(days=back)
         date_str = d.strftime("%Y%m%d")
@@ -610,8 +629,19 @@ def query(data_dir, days=7, owner=None, now_fn=None):
         if roll is not None and roll.get("samples", 0) >= 0:
             has_data = roll.get("samples", 0) > 0 or roll.get("owners")
             if has_data:
-                rollups.append(_filter_owner(roll, owner))
+                filtered = _filter_owner(roll, owner)
+                rollups.append(filtered)
                 dates_covered.append(date_str)
+                # Reuse the per-day (owner-filtered) rollup we just loaded;
+                # no second file read.
+                day_owners = {}
+                for own, acc in (filtered.get("owners") or {}).items():
+                    day_owners[own] = acc.get("gpu_seconds", 0.0)
+                daily.append({
+                    "date": date_str,
+                    "owners": day_owners,
+                    "coverage_seconds": filtered.get("coverage_seconds", 0.0),
+                })
 
     merged = merge_rollups(rollups)
 
@@ -622,6 +652,7 @@ def query(data_dir, days=7, owner=None, now_fn=None):
         "dates_covered": dates_covered,
         "merged": merged,
         "current_idle": current_idle,
+        "daily": daily,
         "generated_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
@@ -642,42 +673,257 @@ def _eff_util(acc):
     return _avg(acc.get("util_wsum", 0.0), acc.get("util_weight", 0.0))
 
 
-def render_stats_text(result, color=False, width=100):
+def _owner_width(owners):
+    """Leaderboard/label owner column width: max name len clamped to [8, 20]."""
+    if not owners:
+        return 8
+    w = max(len(str(o)) for o in owners)
+    if w < 8:
+        w = 8
+    if w > 20:
+        w = 20
+    return w
+
+
+def _clip(s, width):
+    s = str(s)
+    if len(s) <= width:
+        return s
+    return s[:width]
+
+
+def _bucket_level(value, mx, nlevels):
+    """Map value in [0, mx] to a level in 0..nlevels.
+
+    0 stays level 0 (empty); positive values spread across 1..nlevels by
+    quartile-style fractions of the row max.
+    """
+    if value <= 0 or mx <= 0:
+        return 0
+    frac = value / mx
+    if frac > 1.0:
+        frac = 1.0
+    lvl = int(frac * nlevels + 0.9999)  # ceil-ish so tiny > 0 -> level 1
+    if lvl < 1:
+        lvl = 1
+    if lvl > nlevels:
+        lvl = nlevels
+    return lvl
+
+
+# --- award computation ------------------------------------------------------
+
+# Each award: (key, emoji, ascii_tag). Priority = list order (used for the
+# max-3-awards-per-owner rule and to keep output stable).
+_AWARDS = [
+    ("best", "🏆", "[best]"),
+    ("power", "⚡", "[power]"),
+    ("sharp", "🎯", "[sharp]"),
+    ("mem", "🧠", "[mem]"),
+    ("night", "🦉", "[night]"),
+    ("headroom", "💤", "[headroom]"),
+    ("seat", "🪑", "[seat]"),
+]
+
+
+def _compute_awards(owners, pods_cov, coverage_seconds):
+    """Return an ordered list of (award_key, owner, text) that meet thresholds.
+
+    owners excludes the "?" owner. Never raises on empty/one-owner data.
+    Applies the max-3-awards-per-owner rule (drop lowest-priority extras).
+    """
+    items = [(o, a) for o, a in owners.items() if o != NONE_OWNER]
+
+    def gpu_h(acc):
+        return acc.get("gpu_seconds", 0.0) / 3600.0
+
+    def sm_avg(acc):
+        return _avg(acc.get("sm_wsum", 0.0), acc.get("sm_weight", 0.0))
+
+    def util_pct(acc):
+        # avg util prefers SM, else device util
+        return _eff_util(acc)
+
+    raw = {}  # award_key -> (owner, text)
+
+    # 🏆 Best researcher: highest effective GPU-h, require util>=40% and >=1 GPU-h
+    best = None
+    for o, acc in items:
+        gh = gpu_h(acc)
+        u = util_pct(acc)
+        if u is None or gh < 1.0 or u < 40.0:
+            continue
+        eff_h = gh * (u / 100.0)
+        if best is None or eff_h > best[1]:
+            best = (o, eff_h, u, gh)
+    if best is not None:
+        o, eff_h, u, gh = best
+        raw["best"] = (o, "Best researcher: %s — %.1f effective GPU-h "
+                          "(%.0f%% avg over %.1f GPU-h)" % (o, eff_h, u, gh))
+
+    # ⚡ Power user: most GPU-h (>= 1 GPU-h)
+    power = None
+    for o, acc in items:
+        gh = gpu_h(acc)
+        if gh < 1.0:
+            continue
+        if power is None or gh > power[1]:
+            power = (o, gh)
+    if power is not None:
+        o, gh = power
+        raw["power"] = (o, "Power user: %s — %.1f GPU-h" % (o, gh))
+
+    # 🎯 Sharpshooter: highest avg SM% (>= 2 GPU-h)
+    sharp = None
+    for o, acc in items:
+        gh = gpu_h(acc)
+        sm = sm_avg(acc)
+        if sm is None or gh < 2.0:
+            continue
+        if sharp is None or sm > sharp[1]:
+            sharp = (o, sm, gh)
+    if sharp is not None:
+        o, sm, gh = sharp
+        raw["sharp"] = (o, "Sharpshooter: %s — %.0f%% avg SM over %.1f GPU-h"
+                           % (o, sm, gh))
+
+    # 🧠 Memory heavyweight: highest peak mem (>= 32 GiB peak)
+    mem = None
+    for o, acc in items:
+        peak_gib = acc.get("mem_peak_mib", 0) / 1024.0
+        if peak_gib < 32.0:
+            continue
+        if mem is None or peak_gib > mem[1]:
+            mem = (o, peak_gib)
+    if mem is not None:
+        o, peak_gib = mem
+        raw["mem"] = (o, "Memory heavyweight: %s — %.1f GiB peak"
+                         % (o, peak_gib))
+
+    # 🦉 Night owl: largest share of own activity in KST 0-5 (>= 1 GPU-h in win)
+    night = None
+    for o, acc in items:
+        hh = acc.get("hour_hist_kst", [0.0] * 24)
+        total = sum(hh) if hh else 0.0
+        night_s = sum(hh[h] for h in range(6) if h < len(hh)) if hh else 0.0
+        if night_s / 3600.0 < 1.0 or total <= 0:
+            continue
+        share = night_s / total
+        if night is None or share > night[1]:
+            night = (o, share)
+    if night is not None:
+        o, share = night
+        raw["night"] = (o, "Night owl: %s — %.0f%% of activity in KST 0-5h"
+                           % (o, share * 100.0))
+
+    # 💤 Most headroom: lowest avg util among owners with >= 4 GPU-h, util < 40%
+    headroom = None
+    for o, acc in items:
+        gh = gpu_h(acc)
+        u = util_pct(acc)
+        if u is None or gh < 4.0 or u >= 40.0:
+            continue
+        if headroom is None or u < headroom[1]:
+            headroom = (o, u, gh)
+    if headroom is not None:
+        o, u, gh = headroom
+        raw["headroom"] = (o, "Most headroom: %s — %.0f%% avg util over "
+                              "%.0f GPU-h (free speedup waiting)" % (o, u, gh))
+
+    # 🪑 Seat warmer: most idle-allocation hours; only when pod coverage strong
+    if pods_cov > 0.5 * coverage_seconds:
+        seat = None
+        for o, acc in items:
+            idle_h = acc.get("idle_gpu_seconds", 0.0) / 3600.0
+            if idle_h < 2.0:
+                continue
+            if seat is None or idle_h > seat[1]:
+                seat = (o, idle_h)
+        if seat is not None:
+            o, idle_h = seat
+            raw["seat"] = (o, "Seat warmer: %s — %.1f idle GPU-h allocated"
+                              % (o, idle_h))
+
+    # Assemble in priority order.
+    ordered = []
+    for key, _emoji, _tag in _AWARDS:
+        if key in raw:
+            o, text = raw[key]
+            ordered.append((key, o, text))
+
+    # Max 3 awards per owner: keep highest-priority (earliest in list) three.
+    counts = {}
+    kept = []
+    for key, o, text in ordered:
+        n = counts.get(o, 0)
+        if n >= 3:
+            continue
+        counts[o] = n + 1
+        kept.append((key, o, text))
+    return kept
+
+
+def _award_prefix(key, unicode_ok):
+    for k, emoji, tag in _AWARDS:
+        if k == key:
+            return emoji if unicode_ok else tag
+    return ""
+
+
+def render_stats_text(result, color=False, width=100, unicode_ok=True):
     """Render a query() result to a plain (or minimally ANSI) text report."""
     merged = result.get("merged") or _empty_rollup("")
     owners = merged.get("owners") or {}
     window_days = result.get("window_days", 0)
     dates = result.get("dates_covered") or []
+    daily = result.get("daily") or []
     coverage_h = merged.get("coverage_seconds", 0.0) / 3600.0
+    coverage_seconds = merged.get("coverage_seconds", 0.0)
     pods_cov = merged.get("pods_coverage_seconds", 0.0)
 
     lines = []
 
-    title = ("SGPU usage report — last %d days (%d days of data, coverage %.1fh)"
-             % (window_days, len(dates), coverage_h))
-    lines.append(_c("cyan", title, color))
+    # --- a. title + subtitle ---
+    lines.append(_c("cyan", _c("bold", "SGPU usage report — last %d days"
+                               % window_days, color), color))
+    day_word = "day" if len(dates) == 1 else "days"
+    subtitle = "data: %d %s, coverage %.1fh" % (len(dates), day_word, coverage_h)
+    lines.append(_c("dim", subtitle, color))
     lines.append("")
 
     if not owners and merged.get("samples", 0) == 0:
         lines.append("no samples recorded yet")
         return "\n".join(lines) + "\n"
 
-    # --- leaderboard ---
-    header = ("%-12s %7s %8s %10s %9s %8s %8s %6s"
-              % ("OWNER", "GPU-H", "AVG-SM%", "AVG-UTIL%", "PEAK-MEM",
-                 "ALLOC-H", "IDLE-H", "IDLE%"))
-    lines.append(_c("bold", header, color))
-
     ranked = sorted(owners.items(),
                     key=lambda kv: kv[1].get("gpu_seconds", 0.0),
                     reverse=True)
+    ow = _owner_width(owners)
+
+    # --- b. awards ---
+    awards = _compute_awards(owners, pods_cov, coverage_seconds)
+    if awards:
+        lines.append(_c("bold", "Awards", color))
+        for key, _o, text in awards:
+            prefix = _award_prefix(key, unicode_ok)
+            lines.append("%s %s" % (prefix, text))
+        lines.append("")
+
+    # --- c. leaderboard ---
+    lines.append(_c("bold", "Leaderboard", color))
+    header = ("%-*s %6s %6s %8s %10s %9s %8s %8s %6s"
+              % (ow, "OWNER", "GPU-H", "EFF-H", "AVG-SM%", "AVG-UTIL%",
+                 "PEAK-MEM", "ALLOC-H", "IDLE-H", "IDLE%"))
+    lines.append(_c("bold", header, color))
 
     for owner, acc in ranked:
         gpu_h = acc.get("gpu_seconds", 0.0) / 3600.0
         sm = _avg(acc.get("sm_wsum", 0.0), acc.get("sm_weight", 0.0))
         util = _avg(acc.get("util_wsum", 0.0), acc.get("util_weight", 0.0))
+        eff = _eff_util(acc)
         peak_gib = acc.get("mem_peak_mib", 0) / 1024.0
 
+        eff_s = "%.1f" % (gpu_h * (eff / 100.0)) if eff is not None else ""
         sm_s = "%.0f" % sm if sm is not None else ""
         util_s = "%.0f" % util if util is not None else ""
         peak_s = "%.1f" % peak_gib
@@ -696,9 +942,9 @@ def render_stats_text(result, color=False, width=100):
             idle_s = ""
             idlep_s = ""
 
-        row = ("%-12s %7s %8s %10s %9s %8s %8s %6s"
-               % (str(owner)[:12], "%.1f" % gpu_h, sm_s, util_s, peak_s,
-                  alloc_s, idle_s, idlep_s))
+        row = ("%-*s %6s %6s %8s %10s %9s %8s %8s %6s"
+               % (ow, _clip(owner, ow), "%.1f" % gpu_h, eff_s, sm_s, util_s,
+                  peak_s, alloc_s, idle_s, idlep_s))
         lines.append(row)
 
     if pods_cov == 0:
@@ -707,7 +953,49 @@ def render_stats_text(result, color=False, width=100):
                         color))
     lines.append("")
 
-    # --- warnings ---
+    # --- d. daily activity calendar (the "grass") ---
+    if len(dates) >= 2:
+        _render_grass(lines, ranked, daily, dates, ow, color, unicode_ok, width)
+
+    # --- e. KST hour heatmap ---
+    lines.append(_c("bold", "KST hour activity (gpu-seconds share)", color))
+    header_cells = " ".join("%2d" % h for h in range(24))
+    lines.append("%-*s %s" % (ow, "KST", header_cells))
+    # Spark glyphs: unicode blocks when allowed, else ascii ramp.
+    spark = SPARK if unicode_ok else " .:-=+*#"[1:]  # 7 ascii ramp levels
+
+    def spark_row(label, hist):
+        mx = max(hist) if hist else 0.0
+        # two-char columns to align with the numeric header
+        parts = []
+        for v in hist:
+            lvl = _bucket_level(v, mx, len(spark))
+            if lvl == 0:
+                parts.append("  ")
+                continue
+            ch = spark[lvl - 1]
+            if color:
+                # green gradient fg by intensity bucket
+                fg = SPARK_FG[_bucket_level(v, mx, len(SPARK_FG)) - 1]
+                parts.append(" " + _fg256(fg, ch))
+            else:
+                parts.append(" " + ch)
+        body = " ".join(parts)
+        return "%-*s %s" % (ow, _clip(label, ow), body)
+
+    top8 = ranked[:8]
+    total_hist = [0.0] * 24
+    for owner, acc in ranked:
+        hh = acc.get("hour_hist_kst", [0.0] * 24)
+        for i in range(24):
+            total_hist[i] += hh[i] if i < len(hh) else 0.0
+
+    for owner, acc in top8:
+        lines.append(spark_row(owner, acc.get("hour_hist_kst", [0.0] * 24)))
+    lines.append(spark_row("TOTAL", total_hist))
+    lines.append("")
+
+    # --- f. warnings ---
     warnings = []
     for owner, acc in ranked:
         gpu_h = acc.get("gpu_seconds", 0.0) / 3600.0
@@ -729,40 +1017,113 @@ def render_stats_text(result, color=False, width=100):
             lines.append(_c("yellow", "  " + w, color))
         lines.append("")
 
-    # --- KST hour heatmap ---
-    lines.append(_c("bold", "KST hour activity (gpu-seconds share)", color))
-    header_cells = " ".join("%2d" % h for h in range(24))
-    lines.append("KST " + header_cells)
-
-    def spark_row(label, hist):
-        mx = max(hist) if hist else 0.0
-        cells = []
-        for v in hist:
-            if v <= 0 or mx <= 0:
-                cells.append(" ")
-            else:
-                idx = int((v / mx) * (len(SPARK) - 1) + 0.5)
-                if idx < 0:
-                    idx = 0
-                if idx >= len(SPARK):
-                    idx = len(SPARK) - 1
-                cells.append(SPARK[idx])
-        # two-char columns to align with numeric header
-        body = " ".join(" " + ch for ch in cells)
-        return "%-3s %s" % (str(label)[:3], body)
-
-    top8 = ranked[:8]
-    total_hist = [0.0] * 24
-    for owner, acc in ranked:
-        hh = acc.get("hour_hist_kst", [0.0] * 24)
-        for i in range(24):
-            total_hist[i] += hh[i] if i < len(hh) else 0.0
-
-    for owner, acc in top8:
-        lines.append(spark_row(owner, acc.get("hour_hist_kst", [0.0] * 24)))
-    lines.append(spark_row("TOT", total_hist))
-
+    # Drop a trailing blank line for tidiness.
+    while lines and lines[-1] == "":
+        lines.pop()
     return "\n".join(lines) + "\n"
+
+
+def _date_range(first, last):
+    """Inclusive list of YYYYMMDD strings from first..last (calendar order)."""
+    try:
+        a = datetime.strptime(first, "%Y%m%d")
+        b = datetime.strptime(last, "%Y%m%d")
+    except (ValueError, TypeError):
+        return [first, last] if first != last else [first]
+    out = []
+    cur = a
+    while cur <= b:
+        out.append(cur.strftime("%Y%m%d"))
+        cur += timedelta(days=1)
+    return out
+
+
+def _render_grass(lines, ranked, daily, dates, ow, color, unicode_ok, width):
+    """Append the daily-activity calendar block to `lines`.
+
+    One row per owner (top 8 by gpu_seconds) plus a TOTAL row, one 2-char cell
+    per date in the window (oldest->newest, INCLUDING dates with no data,
+    rendered as the empty cell). Cell level is bucketed by fraction of the
+    ROW's own max. When the window has more dates than fit in `width`, keep the
+    MOST RECENT dates and prefix the row with '…'.
+    """
+    lines.append(_c("bold", "Daily activity", color))
+
+    # date -> {owner -> gpu_seconds} lookup from the per-day series.
+    by_date = {}
+    for d in daily:
+        by_date[d.get("date")] = d.get("owners") or {}
+
+    # Full contiguous span from earliest to latest covered date: gap days with
+    # no data still get a (empty) cell, like a GitHub contribution graph.
+    all_dates = _date_range(dates[0], dates[-1]) if dates else []
+
+    grass = GRASS_UNICODE if unicode_ok else GRASS_ASCII
+    nlevels = len(grass) - 1  # 5 non-empty levels
+
+    # Layout: label(ow) + 1 space + optional '…'(1) + 2*ncells <= width.
+    # Cells are 2 chars wide in both modes.
+    budget = width - (ow + 1)
+    if budget < 2:
+        budget = 2
+    truncated = len(all_dates) * 2 > budget
+    if truncated:
+        # reserve 1 col for the '…' marker; keep most-recent dates that fit
+        keep = (budget - 1) // 2
+        if keep < 1:
+            keep = 1
+        shown_dates = all_dates[-keep:]
+    else:
+        shown_dates = list(all_dates)
+    mark = "…" if truncated else ""
+
+    def cell_str(level):
+        if color:
+            return _bg256(GRASS_BG[level], "  ")  # two-space colored bg cell
+        ch = grass[level]
+        return "  " if level == 0 else ch + ch    # doubled glyph, 2 chars wide
+
+    # --- date tick header: MM/DD under every 7th cell starting at the first ---
+    # Each cell occupies 2 columns; cell i starts at column 2*i within the
+    # cells region. The cells region begins after label(ow)+space+mark.
+    prefix_cols = ow + 1 + len(mark)
+    tick = [" "] * prefix_cols
+    for i, ds in enumerate(shown_dates):
+        if i % 7 != 0 or len(ds) != 8:
+            continue
+        label = "%s/%s" % (ds[4:6], ds[6:8])  # MM/DD, 5 chars
+        col = prefix_cols + 2 * i
+        while len(tick) < col + len(label):
+            tick.append(" ")
+        for j, ch in enumerate(label):
+            tick[col + j] = ch
+    lines.append(_c("dim", "".join(tick).rstrip(), color))
+
+    def grass_row(disp, is_total):
+        row_vals = []
+        for ds in shown_dates:
+            owns = by_date.get(ds, {})
+            if is_total:
+                row_vals.append(sum(owns.values()))
+            else:
+                row_vals.append(float(owns.get(disp, 0.0)))
+        mx = max(row_vals) if row_vals else 0.0
+        cells = "".join(cell_str(_bucket_level(v, mx, nlevels)) for v in row_vals)
+        return "%-*s %s%s" % (ow, _clip(disp, ow), mark, cells)
+
+    for owner, _acc in ranked[:8]:
+        lines.append(grass_row(owner, False))
+    lines.append(grass_row("TOTAL", True))
+
+    # --- legend ---
+    if color:
+        swatches = "".join(_bg256(GRASS_BG[lv], "  ")
+                           for lv in range(len(grass)))
+        legend = "less " + swatches + " more"
+    else:
+        legend = "less " + grass + " more"
+    lines.append(_c("dim", legend, color))
+    lines.append("")
 
 
 # --- file listing / raw streaming (for server endpoints) --------------------
