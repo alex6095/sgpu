@@ -20,7 +20,6 @@ esac
 
 echo ""
 echo "Try:"
-echo "  sgpu once"
-echo "  sgpu"
-echo "  sgpu smi"
-echo "  sgpu stop"
+echo "  sgpu           # interactive TUI"
+echo "  sgpu once      # one-shot dashboard"
+echo "  sgpu stats     # usage report"

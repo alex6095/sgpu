@@ -1,380 +1,122 @@
+# sgpu — thin client for the in-pod sgpu monitor.
+# All rendering happens server-side; this script only shells out to kubectl.
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("top", "once", "smi", "apps", "pods", "gpustat", "url", "status", "stop", "open")]
+    [ValidateSet("top", "once", "watch", "apps", "stats", "nvitop", "pods",
+                 "smi", "gpustat", "json", "health", "version", "help")]
     [string]$Command = "top",
     [Parameter(Position = 1)]
+    [int]$Arg = 0,                    # days for stats, seconds for watch
     [Alias("Refresh", "Every")]
     [int]$Interval = 2,
-    [int]$Port = 18080,
-    [string]$Namespace = "p-sgvr-node-02",
-    [string]$Service = "sangmin-gpu-monitor",
-    [string]$Pod = "sangmin-gpu-monitor",
-    [switch]$UseExec,
-    [switch]$UsePortForward,
-    [switch]$NoColor,
-    [switch]$ShareOnLan
+    [string]$Namespace = $(if ($env:SGPU_NAMESPACE) { $env:SGPU_NAMESPACE } else { "p-sgvr-node-02" }),
+    [string]$Pod = $(if ($env:SGPU_POD) { $env:SGPU_POD } else { "sangmin-gpu-monitor" }),
+    [switch]$NoColor
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-$scriptDir = $PSScriptRoot
-$repoRoot = Split-Path -Parent $scriptDir
-$forwardScript = Join-Path $scriptDir "gpu-monitor-local.ps1"
-$baseUrl = "http://127.0.0.1:${Port}"
-$transport = "exec"
-if ($UsePortForward -or $env:SGPU_TRANSPORT -in @("port-forward", "pf", "tunnel")) {
-    $transport = "port-forward"
-}
-if ($UseExec -or $env:SGPU_TRANSPORT -eq "exec") {
-    $transport = "exec"
-}
-$script:MonitorNode = $null
-$script:PodTable = ""
-$script:PodTableAt = [datetime]::MinValue
-$validCommands = @("top", "once", "smi", "apps", "pods", "gpustat", "url", "status", "stop", "open")
+function Show-Usage {
+    Write-Host @"
+usage: sgpu [command] [options]
 
-if ($args.Count -gt 0 -and $Command -eq "top" -and $validCommands -contains $args[0]) {
-    $Command = [string]$args[0]
-    if ($args.Count -gt 1 -and [string]$args[1] -match "^\d+$") {
-        $Interval = [int]$args[1]
+commands:
+  (none) | top     interactive TUI (scroll, sort, owner filter)
+  once             one-shot dashboard
+  watch [sec]      simple refresh loop (for dumb terminals)
+  apps             GPU process table with pod owners
+  stats [days]     per-owner usage report (default 7 days)
+  nvitop           raw nvitop TUI
+  pods | smi | gpustat | json | health | version
+
+options:
+  -Namespace NS    kubernetes namespace   (default p-sgvr-node-02)
+  -Pod NAME        monitor pod name       (default sangmin-gpu-monitor)
+  -Refresh SEC     TUI/watch refresh interval (default 2)
+  -NoColor         disable ANSI colors
+"@
+}
+
+function Show-FailureHint([string]$Output) {
+    Write-Host "sgpu: cannot reach monitor pod '$Pod' in namespace '$Namespace'"
+    $tail = ($Output -split "`n" | Select-Object -Last 3) -join "`n"
+    Write-Host $tail
+    if ($Output -match "(?i)not ?found") {
+        Write-Host "hint: the monitor pod is not running. Deploy it with:"
+        Write-Host "  kubectl apply -f https://raw.githubusercontent.com/alex6095/sgpu/main/k8s/gpu-monitor.yaml"
+    } elseif ($Output -match "(?i)unauthorized|forbidden|credentials") {
+        Write-Host "hint: check your access: kubectl auth can-i get pods -n $Namespace"
     }
 }
 
-if ($Command -in @("url", "open")) {
-    $transport = "port-forward"
+function Get-FromPod([string]$Path) {
+    $output = & kubectl exec -n $Namespace $Pod -- curl -fsS "http://127.0.0.1:8080$Path" 2>&1
+    $text = ($output | ForEach-Object { $_.ToString() }) -join "`n"
+    if ($LASTEXITCODE -ne 0) {
+        Show-FailureHint $text
+        return $null
+    }
+    return $text
 }
 
-function Ensure-Tunnel {
-    if ($transport -eq "exec") {
+function Get-ColorParam {
+    if ($NoColor -or [Console]::IsOutputRedirected) { return "color=0" }
+    return "color=1"
+}
+
+function Get-ColsParam {
+    try {
+        $width = [Console]::WindowWidth
+        if ($width -lt 40) { $width = 120 }
+    } catch { $width = 120 }
+    return "cols=$width"
+}
+
+function Invoke-Interactive([string[]]$PodCommand) {
+    if ([Console]::IsOutputRedirected -or [Console]::IsInputRedirected) {
+        # No TTY to hand over — degrade to a one-shot dashboard.
+        $text = Get-FromPod "/table?color=0&$(Get-ColsParam)"
+        if ($null -ne $text) { Write-Output $text }
         return
     }
-    $args = @("-Namespace", $Namespace, "-Service", $Service, "-LocalPort", $Port)
-    if ($ShareOnLan) {
-        $args += "-ShareOnLan"
-    }
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $forwardScript @args | Out-Null
+    & kubectl exec -it -n $Namespace $Pod -- @PodCommand
 }
 
-function Stop-Tunnel {
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $forwardScript -Namespace $Namespace -Service $Service -LocalPort $Port -Stop
-}
-
-function Show-Status {
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $forwardScript -Namespace $Namespace -Service $Service -LocalPort $Port -Status
-}
-
-function Get-Text([string]$Path) {
-    if ($transport -eq "exec") {
-        $url = "http://127.0.0.1:8080$Path"
-        $output = & kubectl exec -n $Namespace $Pod -- bash -lc "curl -fsS '$url'" 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw (($output | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine)
-        }
-        return (($output | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine)
-    }
-    try {
-        return (Invoke-WebRequest -UseBasicParsing -Uri "$baseUrl$Path" -TimeoutSec 5).Content
-    } catch {
-        Ensure-Tunnel
-        return (Invoke-WebRequest -UseBasicParsing -Uri "$baseUrl$Path" -TimeoutSec 8).Content
-    }
-}
-
-function Get-MonitorNode {
-    if ($script:MonitorNode) {
-        return $script:MonitorNode
-    }
-    try {
-        $script:MonitorNode = kubectl get pod $Pod -n $Namespace -o jsonpath='{.spec.nodeName}'
-    } catch {
-        $script:MonitorNode = ""
-    }
-    return $script:MonitorNode
-}
-
-function Get-PodAge([string]$StartTime) {
-    if (-not $StartTime) {
-        return "?"
-    }
-    try {
-        $started = ([datetime]::Parse($StartTime)).ToUniversalTime()
-        $span = [datetime]::UtcNow - $started
-    } catch {
-        return "?"
-    }
-    if ($span.TotalDays -ge 1) {
-        return ("{0}d{1}h" -f [int]$span.TotalDays, $span.Hours)
-    }
-    if ($span.TotalHours -ge 1) {
-        return ("{0}h{1}m" -f [int]$span.TotalHours, $span.Minutes)
-    }
-    return ("{0}m" -f [int][Math]::Max(0, $span.TotalMinutes))
-}
-
-function Get-OwnerPrefix([string]$Name) {
-    if (-not $Name) {
-        return "?"
-    }
-    return (($Name -replace "_", "-") -split "-", 2)[0]
-}
-
-function Get-GpuRequest($Pod) {
-    $gpu = 0
-    foreach ($container in $Pod.spec.containers) {
-        $value = $null
-        if ($container.resources.requests.'nvidia.com/gpu') {
-            $value = $container.resources.requests.'nvidia.com/gpu'
-        } elseif ($container.resources.limits.'nvidia.com/gpu') {
-            $value = $container.resources.limits.'nvidia.com/gpu'
-        }
-        if ($value) {
-            $gpu += [int]$value
-        }
-    }
-    return $gpu
-}
-
-function Get-KubePodTable {
-    if (((Get-Date) - $script:PodTableAt).TotalSeconds -lt 10 -and $script:PodTable) {
-        return $script:PodTable
-    }
-    try {
-        $node = Get-MonitorNode
-        $pods = kubectl get pods -n $Namespace -o json | ConvertFrom-Json
-        $rows = @()
-        foreach ($pod in $pods.items) {
-            if ($pod.status.phase -notin @("Running", "Pending")) {
-                continue
-            }
-            if ($node -and $pod.spec.nodeName -ne $node) {
-                continue
-            }
-            $gpu = Get-GpuRequest $pod
-            if ($gpu -le 0) {
-                continue
-            }
-            $rows += [pscustomobject]@{
-                Owner = Get-OwnerPrefix $pod.metadata.name
-                GPU = $gpu
-                Age = Get-PodAge $pod.status.startTime
-                Phase = $pod.status.phase
-                Pod = $pod.metadata.name
-            }
-        }
-        $lines = New-Object System.Collections.Generic.List[string]
-        $lines.Add("")
-        $lines.Add("Kubernetes GPU pods from local kubectl")
-        $lines.Add("OWNER    GPU  AGE     PHASE    POD")
-        $lines.Add("-------  ---  ------  -------  ----------------------------------------")
-        if ($rows.Count -eq 0) {
-            $lines.Add("(no Running/Pending GPU-requesting pods found)")
-        } else {
-            foreach ($row in ($rows | Sort-Object Owner, Pod)) {
-                $lines.Add(("{0,-7}  {1,3}  {2,-6}  {3,-7}  {4}" -f $row.Owner.Substring(0, [Math]::Min(7, $row.Owner.Length)), $row.GPU, $row.Age, $row.Phase, $row.Pod))
-            }
-        }
-        $script:PodTable = ($lines -join [Environment]::NewLine)
-        $script:PodTableAt = Get-Date
-        return $script:PodTable
-    } catch {
-        return "`nKubernetes GPU pods from local kubectl: unavailable ($($_.Exception.Message))"
-    }
-}
-
-function Print-Text([string]$Path) {
-    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-    Write-Output (Get-Text $Path)
-}
-
-function Print-Dashboard {
-    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-    Write-Output (Get-DashboardText)
-}
-
-function Get-DashboardText {
-    $parts = @(
-        (Get-Text "/table").TrimEnd(),
-        (Get-KubePodTable).TrimEnd()
-    )
-    return ($parts -join ([Environment]::NewLine + [Environment]::NewLine))
-}
-
-function Start-LiveDashboard {
-    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+function Invoke-WatchLoop {
     $esc = [char]27
-    [Console]::Write("${esc}[?1049h${esc}[?25l${esc}[2J${esc}[H")
+    $seconds = if ($Arg -gt 0) { $Arg } else { $Interval }
+    [Console]::Write("${esc}[?1049h${esc}[?25l")
     try {
         while ($true) {
-            try {
-                $frame = (Get-DashboardText).TrimEnd() +
-                    [Environment]::NewLine +
-                    [Environment]::NewLine +
-                    "refresh=${Interval}s  transport=${transport}  commands: sgpu once | sgpu smi | sgpu apps | sgpu stop" +
-                    [Environment]::NewLine
-                Render-Frame $frame
-            } catch {
-                Render-Frame "sgpu: $($_.Exception.Message)"
-            }
-            Start-Sleep -Seconds $Interval
+            $frame = Get-FromPod "/table?$(Get-ColorParam)&$(Get-ColsParam)"
+            if ($null -eq $frame) { $frame = "sgpu: fetch failed; retrying..." }
+            [Console]::Write("${esc}[H" + $frame + "`n${esc}[0J")
+            Start-Sleep -Seconds $seconds
         }
     } finally {
         [Console]::Write("${esc}[?25h${esc}[?1049l")
     }
 }
 
-function Get-TerminalWidth {
-    try {
-        $width = [Console]::WindowWidth
-        if ($width -lt 20) {
-            return 80
-        }
-        return $width
-    } catch {
-        return 100
-    }
+function Write-PodText([string]$Path) {
+    $text = Get-FromPod $Path
+    if ($null -ne $text) { Write-Output $text }
 }
-
-function Get-TerminalHeight {
-    try {
-        $height = [Console]::WindowHeight
-        if ($height -lt 8) {
-            return 24
-        }
-        return $height
-    } catch {
-        return 30
-    }
-}
-
-function Limit-Line([string]$Line, [int]$Width) {
-    $max = [Math]::Max(1, $Width - 1)
-    if ($Line.Length -le $max) {
-        return $Line
-    }
-    if ($max -le 1) {
-        return ""
-    }
-    return $Line.Substring(0, $max - 1) + ">"
-}
-
-function Color-Code([string]$Name) {
-    if ($NoColor -or [Console]::IsOutputRedirected) {
-        return ""
-    }
-    $esc = [char]27
-    switch ($Name) {
-        "reset" { return "${esc}[0m" }
-        "bold" { return "${esc}[1m" }
-        "dim" { return "${esc}[2m" }
-        "cyan" { return "${esc}[36m" }
-        "green" { return "${esc}[32m" }
-        "yellow" { return "${esc}[33m" }
-        "red" { return "${esc}[31m" }
-        "magenta" { return "${esc}[35m" }
-        default { return "" }
-    }
-}
-
-function Style-Line([string]$Line) {
-    if ($NoColor) {
-        return $Line
-    }
-    $reset = Color-Code "reset"
-    if (-not $reset) {
-        return $Line
-    }
-    if ($Line -match "^(SGPU\s+)?MLXP GPU monitor") {
-        return "$(Color-Code "bold")$(Color-Code "cyan")$Line$reset"
-    }
-    if ($Line -match "^(NVIDIA compute processes|Kubernetes GPU pods)") {
-        return "$(Color-Code "bold")$(Color-Code "magenta")$Line$reset"
-    }
-    if ($Line -match "^(GPU  Name|OWNER\s+GPU|GPU UUID)") {
-        return "$(Color-Code "bold")$Line$reset"
-    }
-    if ($Line -match "^-{3,}") {
-        return "$(Color-Code "dim")$Line$reset"
-    }
-    if ($Line -match "^\s*\d+\s+NVIDIA" -and $Line -match "\s+(\d+)%") {
-        $util = [int]$Matches[1]
-        if ($util -ge 90) {
-            return "$(Color-Code "red")$Line$reset"
-        }
-        if ($util -ge 50) {
-            return "$(Color-Code "yellow")$Line$reset"
-        }
-        return "$(Color-Code "green")$Line$reset"
-    }
-    if ($Line -match "^refresh=") {
-        return "$(Color-Code "dim")$Line$reset"
-    }
-    return $Line
-}
-
-function Render-Frame([string]$Frame) {
-    $esc = [char]27
-    $width = Get-TerminalWidth
-    $height = Get-TerminalHeight
-    $maxRows = [Math]::Max(1, $height - 1)
-    $lines = ($Frame -replace "`r", "") -split "`n"
-    $rowCount = [Math]::Min($lines.Count, $maxRows)
-    [Console]::Write("${esc}[H")
-    for ($i = 0; $i -lt $rowCount; $i++) {
-        $line = $lines[$i]
-        if ($line -match "^MLXP GPU monitor") {
-            $line = "SGPU  $line"
-        }
-        [Console]::Write("${esc}[2K")
-        [Console]::Write((Style-Line (Limit-Line $line $width)))
-        if ($i -lt ($rowCount - 1)) {
-            [Console]::Write([Environment]::NewLine)
-        }
-    }
-    [Console]::Write("${esc}[J")
-}
-
-if ($Command -eq "stop") {
-    Stop-Tunnel
-    exit 0
-}
-
-if ($Command -eq "status") {
-    if ($transport -eq "exec") {
-        Write-Host "sgpu default transport=exec; no local port-forward is used for top/once/smi/apps."
-        Show-Status
-        exit 0
-    }
-    Show-Status
-    exit 0
-}
-
-Ensure-Tunnel
 
 switch ($Command) {
-    "url" {
-        Write-Host "$baseUrl/table"
-        Write-Host "$baseUrl/smi"
-        Write-Host "$baseUrl/apps"
-    }
-    "open" {
-        Start-Process "$baseUrl/table"
-    }
-    "once" {
-        Print-Dashboard
-    }
-    "smi" {
-        Print-Text "/smi"
-    }
-    "apps" {
-        Print-Text "/apps"
-    }
-    "pods" {
-        Print-Text "/pods"
-    }
-    "gpustat" {
-        Print-Text "/gpustat"
-    }
-    "top" {
-        Start-LiveDashboard
-    }
+    "help"    { Show-Usage }
+    "top"     { Invoke-Interactive @("python3", "/opt/gpu-monitor/tui.py", "$Interval") }
+    "nvitop"  { Invoke-Interactive @("nvitop") }
+    "once"    { Write-PodText "/table?$(Get-ColorParam)&$(Get-ColsParam)" }
+    "watch"   { Invoke-WatchLoop }
+    "apps"    { Write-PodText "/apps?$(Get-ColorParam)&$(Get-ColsParam)" }
+    "stats"   { $days = if ($Arg -gt 0) { $Arg } else { 7 }
+                Write-PodText "/stats?days=$days&$(Get-ColorParam)&$(Get-ColsParam)" }
+    "pods"    { Write-PodText "/pods" }
+    "smi"     { Write-PodText "/smi" }
+    "gpustat" { Write-PodText "/gpustat" }
+    "json"    { Write-PodText "/json" }
+    "health"  { Write-PodText "/health" }
+    "version" { Write-PodText "/version" }
 }
