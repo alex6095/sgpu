@@ -1,263 +1,56 @@
-import csv
+"""sgpu monitor HTTP server (pod entry point).
+
+Thin layer only: routing and query parsing. Data collection lives in
+collector.py, k8s access in kube.py, layout in render.py, usage accounting
+in statsdb.py / statsagg.py. Endpoints render server-side so that every
+client — including plain `kubectl exec ... curl` with nothing installed —
+gets the same dashboard. Plain text by default; ANSI color is opt-in via
+?color=1 because the server cannot see the client's TTY.
+"""
+
 import json
-import os
-import ssl
 import subprocess
-import time
-import urllib.error
-import urllib.request
-from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+import collector
+import render
+
+try:
+    import statsdb
+    import statsagg
+    STATS_IMPORT_ERROR = None
+except Exception as exc:  # never let a stats bug take monitoring down
+    statsdb = None
+    statsagg = None
+    STATS_IMPORT_ERROR = "%s: %s" % (type(exc).__name__, exc)
 
 
-GPU_FIELDS = [
-    "index",
-    "uuid",
-    "name",
-    "temperature.gpu",
-    "utilization.gpu",
-    "memory.total",
-    "memory.used",
-    "memory.free",
-    "power.draw",
-    "power.limit",
-]
-
-APP_FIELDS = [
-    "gpu_uuid",
-    "pid",
-    "process_name",
-    "used_memory",
-]
-
-CACHE = {}
-CACHE_TTL_SECONDS = float(os.environ.get("GPU_MONITOR_CACHE_TTL", "1.0"))
-NODE_NAME = os.environ.get("NODE_NAME", "")
-NAMESPACE = os.environ.get("POD_NAMESPACE", "p-sgvr-node-02")
-
-
-def run(cmd, timeout=5):
+def run_cmd(cmd, timeout=8):
     try:
-        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
-        return {
-            "ok": proc.returncode == 0,
-            "returncode": proc.returncode,
-            "stdout": proc.stdout,
-            "stderr": proc.stderr,
-        }
+        proc = subprocess.run(cmd, text=True, capture_output=True,
+                              timeout=timeout)
+        return proc.returncode == 0, proc.stdout + proc.stderr
     except Exception as exc:
-        return {
-            "ok": False,
-            "returncode": -1,
-            "stdout": "",
-            "stderr": f"{type(exc).__name__}: {exc}",
-        }
+        return False, "%s: %s" % (type(exc).__name__, exc)
 
 
-def query_csv(kind, fields):
-    result = run([
-        "nvidia-smi",
-        f"--query-{kind}=" + ",".join(fields),
-        "--format=csv,noheader,nounits",
-    ])
-    rows = []
-    if result["ok"]:
-        for row in csv.reader(result["stdout"].splitlines()):
-            if row:
-                rows.append({key: value.strip() for key, value in zip(fields, row)})
-    result["rows"] = rows
-    return result
-
-
-def kube_api(path, timeout=3):
-    token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
-    ca_path = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-    if not os.path.exists(token_path):
-        return {"ok": False, "error": "service account token is not mounted"}
-    with open(token_path, "r", encoding="utf-8") as token_file:
-        token = token_file.read().strip()
-    url = f"https://kubernetes.default.svc{path}"
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-    context = ssl.create_default_context(cafile=ca_path)
-    try:
-        with urllib.request.urlopen(req, context=context, timeout=timeout) as response:
-            return {"ok": True, "data": json.loads(response.read().decode("utf-8"))}
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8")
-        try:
-            message = json.loads(body).get("message", body)
-        except json.JSONDecodeError:
-            message = body
-        return {"ok": False, "error": f"HTTP {exc.code}: {message[:180]}"}
-    except Exception as exc:
-        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-
-
-def parse_int(value, default=0):
-    try:
-        return int(str(value).strip())
-    except Exception:
-        return default
-
-
-def age_from_start(start_time):
-    if not start_time:
-        return "?"
-    try:
-        started = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
-    except ValueError:
-        return "?"
-    seconds = max(0, int((datetime.now(timezone.utc) - started).total_seconds()))
-    days, seconds = divmod(seconds, 86400)
-    hours, seconds = divmod(seconds, 3600)
-    minutes = seconds // 60
-    if days:
-        return f"{days}d{hours}h"
-    if hours:
-        return f"{hours}h{minutes}m"
-    return f"{minutes}m"
-
-
-def owner_from_name(name):
-    if not name:
-        return "?"
-    normalized = name.replace("_", "-")
-    return normalized.split("-", 1)[0]
-
-
-def gpu_request_for_pod(pod):
-    total = 0
-    for container in pod.get("spec", {}).get("containers", []):
-        requests = container.get("resources", {}).get("requests", {})
-        limits = container.get("resources", {}).get("limits", {})
-        total += parse_int(requests.get("nvidia.com/gpu", limits.get("nvidia.com/gpu", 0)))
-    return total
-
-
-def list_gpu_pods():
-    result = kube_api(f"/api/v1/namespaces/{NAMESPACE}/pods")
-    if not result["ok"]:
-        return {"ok": False, "error": result["error"], "rows": []}
-    rows = []
-    for pod in result["data"].get("items", []):
-        phase = pod.get("status", {}).get("phase", "")
-        if phase not in ("Running", "Pending"):
-            continue
-        gpu = gpu_request_for_pod(pod)
-        if gpu <= 0:
-            continue
-        node = pod.get("spec", {}).get("nodeName", "")
-        if NODE_NAME and node != NODE_NAME:
-            continue
-        name = pod.get("metadata", {}).get("name", "")
-        rows.append({
-            "owner": owner_from_name(name),
-            "pod": name,
-            "node": node,
-            "phase": phase,
-            "gpu": gpu,
-            "age": age_from_start(pod.get("status", {}).get("startTime")),
-        })
-    rows.sort(key=lambda row: (row["owner"], row["pod"]))
-    return {"ok": True, "rows": rows}
-
-
-def snapshot(force=False):
-    now = time.time()
-    cached_at = CACHE.get("time", 0)
-    if not force and now - cached_at < CACHE_TTL_SECONDS:
-        return CACHE["data"]
-    data = {
-        "time": datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
-        "node": NODE_NAME or "?",
-        "gpus": query_csv("gpu", GPU_FIELDS),
-        "apps": query_csv("compute-apps", APP_FIELDS),
-        "pods": list_gpu_pods(),
-    }
-    CACHE["time"] = now
-    CACHE["data"] = data
-    return data
-
-
-def fmt(value, suffix="", width=0):
-    text = "?" if value in ("[Not Supported]", "N/A", "") else str(value)
-    if suffix and text != "?":
-        text += suffix
-    return text.rjust(width) if width else text
-
-
-def render_table(data):
-    lines = []
-    lines.append(f"MLXP GPU monitor  node={data['node']}  time={data['time']}")
-    lines.append("")
-    lines.append("GPU  Name        Used/Total MiB        Util  Temp  Power")
-    lines.append("---  ----------  --------------------  ----  ----  --------")
-    if data["gpus"]["ok"]:
-        for row in data["gpus"]["rows"]:
-            used = fmt(row.get("memory.used"), width=6)
-            total = fmt(row.get("memory.total"), width=6)
-            util = fmt(row.get("utilization.gpu"), "%", 5)
-            temp = fmt(row.get("temperature.gpu"), "C", 5)
-            power = f"{fmt(row.get('power.draw'), width=5)}/{fmt(row.get('power.limit'))}W"
-            lines.append(
-                f"{row.get('index', '?'):>3}  {row.get('name', '?'):<10}  "
-                f"{used}/{total}          {util}  {temp}  {power}"
-            )
+def footer_notes():
+    notes = []
+    if statsdb is None:
+        notes.append("stats disabled: %s" % STATS_IMPORT_ERROR)
     else:
-        lines.append(data["gpus"]["stderr"] or "nvidia-smi query failed")
-
-    pods = data["pods"]
-    if pods["ok"]:
-        lines.append("")
-        lines.append("Kubernetes GPU pods on this node")
-        lines.append("OWNER    GPU  AGE     PHASE    POD")
-        lines.append("-------  ---  ------  -------  ----------------------------------------")
-        if pods["rows"]:
-            for row in pods["rows"]:
-                lines.append(
-                    f"{row['owner'][:7]:<7}  {row['gpu']:>3}  {row['age']:<6}  "
-                    f"{row['phase']:<7}  {row['pod']}"
-                )
-        else:
-            lines.append("(no Running/Pending GPU-requesting pods visible)")
-
-    lines.append("")
-    apps = data["apps"]
-    if apps["ok"] and apps["rows"]:
-        lines.append("NVIDIA compute processes")
-        lines.append("GPU UUID                              PID      MEM     NAME")
-        lines.append("------------------------------------  -------  ------  ----------------")
-        for row in apps["rows"]:
-            lines.append(
-                f"{row.get('gpu_uuid', '?'):<36}  {row.get('pid', '?'):>7}  "
-                f"{row.get('used_memory', '?'):>6}  {row.get('process_name', '?')}"
-            )
-    else:
-        lines.append("NVIDIA compute processes: none reported by nvidia-smi in this container.")
-        lines.append("Use the Kubernetes pod list above as the reliable owner/pod view.")
-    return "\n".join(lines) + "\n"
-
-
-def render_apps(data):
-    lines = []
-    apps = data["apps"]
-    if apps["ok"] and apps["rows"]:
-        for row in apps["rows"]:
-            lines.append(json.dumps(row, ensure_ascii=False))
-    else:
-        lines.append("No compute processes reported by nvidia-smi.")
-    lines.append("")
-    lines.append("GPU-requesting pods:")
-    pods = data["pods"]
-    if pods["ok"]:
-        for row in pods["rows"]:
-            lines.append(f"{row['owner']} gpu={row['gpu']} age={row['age']} phase={row['phase']} pod={row['pod']}")
-    else:
-        lines.append("Pod list unavailable from monitor pod; local sgpu adds this via kubectl.")
-    return "\n".join(lines) + "\n"
+        status = statsdb.status()
+        if status.get("fallback"):
+            notes.append("stats degraded: writing to %s (hostPath "
+                         "unavailable; history is lost on pod restart)"
+                         % status.get("data_dir"))
+    return notes
 
 
 class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
     def send_body(self, code, body, content_type="text/plain; charset=utf-8"):
         data = body if isinstance(body, bytes) else body.encode("utf-8")
         self.send_response(code)
@@ -267,42 +60,139 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def send_json(self, code, payload):
+        self.send_body(code, json.dumps(payload, indent=2, ensure_ascii=False),
+                       "application/json")
+
     def do_GET(self):
-        path = self.path.split("?", 1)[0]
+        try:
+            self.route()
+        except BrokenPipeError:
+            pass
+        except Exception as exc:
+            try:
+                self.send_body(500, "sgpu server error: %s: %s\n"
+                               % (type(exc).__name__, exc))
+            except Exception:
+                pass
+
+    def route(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        query = parse_qs(parsed.query)
+
+        def q(name, default=None):
+            return query.get(name, [default])[0]
+
+        color = q("color") == "1"
+        try:
+            width = max(40, min(500, int(q("cols") or 120)))
+        except ValueError:
+            width = 120
+        unicode_ok = q("ascii") != "1"
+
         if path in ("/", "/table", "/short"):
-            self.send_body(200, render_table(snapshot()))
-            return
-        if path == "/health":
-            result = run(["nvidia-smi", "-L"])
-            self.send_body(200 if result["ok"] else 503, result["stdout"] or result["stderr"])
-            return
-        if path == "/smi":
-            result = run(["nvidia-smi"], timeout=8)
-            self.send_body(200 if result["ok"] else 503, result["stdout"] + result["stderr"])
+            snapshot = collector.collect()
+            self.send_body(200, render.render_text(
+                snapshot, width=width, color=color, unicode_ok=unicode_ok,
+                footer_notes=footer_notes()))
             return
         if path == "/apps":
-            self.send_body(200, render_apps(snapshot()))
-            return
-        if path == "/pods":
-            pods = snapshot()["pods"]
-            self.send_body(200 if pods["ok"] else 503, json.dumps(pods, indent=2, ensure_ascii=False), "application/json")
-            return
-        if path == "/gpustat":
-            result = run(["gpustat", "--no-color"], timeout=5)
-            self.send_body(200 if result["ok"] else 503, result["stdout"] + result["stderr"])
-            return
-        if path == "/topo":
-            result = run(["nvidia-smi", "topo", "-m"], timeout=8)
-            self.send_body(200 if result["ok"] else 503, result["stdout"] + result["stderr"])
+            self.send_body(200, render.render_procs_text(
+                collector.collect(), width=width, color=color))
             return
         if path == "/json":
-            self.send_body(200, json.dumps(snapshot(), indent=2, ensure_ascii=False), "application/json")
+            self.send_json(200, collector.collect())
+            return
+        if path == "/pods":
+            pods = collector.collect()["pods"]
+            self.send_json(200 if pods.get("ok") else 503, pods)
+            return
+        if path == "/health":
+            snapshot = collector.collect()
+            healthy = bool(snapshot.get("gpus")) or snapshot["source"] == "mock"
+            self.send_body(200 if healthy else 503,
+                           "%s gpus=%d source=%s\n" % (
+                               "ok" if healthy else "degraded",
+                               len(snapshot.get("gpus", [])),
+                               snapshot["source"]))
+            return
+        if path == "/smi":
+            ok, out = run_cmd(["nvidia-smi"])
+            self.send_body(200 if ok else 503, out)
+            return
+        if path == "/topo":
+            ok, out = run_cmd(["nvidia-smi", "topo", "-m"])
+            self.send_body(200 if ok else 503, out)
+            return
+        if path == "/gpustat":
+            ok, out = run_cmd(["gpustat", "--no-color"], timeout=6)
+            self.send_body(200 if ok else 503, out)
+            return
+        if path == "/version":
+            payload = {
+                "sgpu_version": collector.SGPU_VERSION,
+                "schema": collector.SCHEMA,
+                "source": collector.collect()["source"],
+                "nvml": collector.nvml_status(),
+                "stats": (statsdb.status() if statsdb
+                          else {"error": STATS_IMPORT_ERROR}),
+            }
+            self.send_json(200, payload)
+            return
+        if path.startswith("/stats"):
+            self.route_stats(path, q, color, width)
+            return
+        self.send_body(404, "not found\n")
+
+    def route_stats(self, path, q, color, width):
+        if statsdb is None or statsagg is None:
+            self.send_body(503, "stats unavailable: %s\n" % STATS_IMPORT_ERROR)
+            return
+        data_dir = statsdb.resolved_data_dir()
+        if path == "/stats/files":
+            self.send_json(200, statsagg.list_files(data_dir))
+            return
+        if path == "/stats/raw":
+            date = (q("date") or "").replace("-", "")
+            if not date.isdigit() or len(date) != 8:
+                self.send_body(400, "usage: /stats/raw?date=YYYYMMDD\n")
+                return
+            try:
+                body = "".join(statsagg.iter_raw_lines(data_dir, date))
+            except FileNotFoundError:
+                self.send_body(404, "no samples for %s\n" % date)
+                return
+            self.send_body(200, body, "application/x-ndjson; charset=utf-8")
+            return
+        if path == "/stats":
+            try:
+                days = max(1, min(365, int(q("days") or 7)))
+            except ValueError:
+                days = 7
+            result = statsagg.query(data_dir, days=days, owner=q("owner"))
+            if q("format") == "json":
+                self.send_json(200, result)
+                return
+            self.send_body(200, statsagg.render_stats_text(
+                result, color=color, width=width))
             return
         self.send_body(404, "not found\n")
 
     def log_message(self, fmt_string, *args):
-        print("%s - %s" % (self.address_string(), fmt_string % args), flush=True)
+        print("%s - %s" % (self.address_string(), fmt_string % args),
+              flush=True)
 
 
 if __name__ == "__main__":
+    if statsdb is not None:
+        try:
+            statsdb.start_sampler(collector.collect)
+        except Exception as exc:
+            print("sgpu: stats sampler failed to start: %s" % exc, flush=True)
+    else:
+        print("sgpu: stats modules unavailable: %s" % STATS_IMPORT_ERROR,
+              flush=True)
+    print("sgpu server %s listening on :8080" % collector.SGPU_VERSION,
+          flush=True)
     ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
