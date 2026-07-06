@@ -97,8 +97,9 @@ GPU-requesting pod every 15 seconds, around the clock:
   activity heatmap.
 - **Raw export**: `/stats/raw?date=YYYYMMDD` (NDJSON) and `/stats/files`.
 
-Storage is a `hostPath` on the node (`/var/lib/sgpu`), so history survives
-pod restarts.
+Storage is a node-local PVC (`sgpu-data`, storage class `local-path`,
+mounted at `/var/lib/sgpu`), so history survives pod restarts. (`hostPath`
+is denied by the cluster's kyverno policy.)
 
 ## HTTP endpoints (inside the pod, `:8080`)
 
@@ -111,12 +112,27 @@ pod restarts.
 
 ## Deploy / operate the monitor pod
 
-```bash
-# Build + push the image (needs NCR login)
-docker build -f docker/Dockerfile.gpu-monitor -t vnxb4cz3.kr.private-ncr.ntruss.com/sangmin/gpu-monitor:nvml-580.126.16-v5 .
-docker push vnxb4cz3.kr.private-ncr.ntruss.com/sangmin/gpu-monitor:nvml-580.126.16-v5
+The NCR registry (`vnxb4cz3.kr.private-ncr.ntruss.com`) resolves to a
+**private IP** — it is reachable only from inside the cluster network, so
+build and push from a dind pod, not from your laptop:
 
-# Pods are immutable — recreate to roll out
+```bash
+IMG=vnxb4cz3.kr.private-ncr.ntruss.com/sangmin/gpu-monitor:nvml-580.126.16-v5
+DIND="kubectl exec -n p-sgvr-node-02 sangmin-ulr-v2-dind-dev -c docker-cli --"
+
+# 1. Copy the (tiny) build context into the dind pod and build
+tar cf - docker tools .dockerignore | kubectl exec -i -n p-sgvr-node-02 \
+  sangmin-ulr-v2-dind-dev -c docker-cli -- \
+  sh -c 'rm -rf /tmp/sgpu-build && mkdir -p /tmp/sgpu-build && tar xf - -C /tmp/sgpu-build'
+$DIND sh -c "cd /tmp/sgpu-build && docker build -f docker/Dockerfile.gpu-monitor -t $IMG ."
+
+# 2. Login (interactive), push, then REMOVE the stored credential
+kubectl exec -it -n p-sgvr-node-02 sangmin-ulr-v2-dind-dev -c docker-cli -- \
+  docker login vnxb4cz3.kr.private-ncr.ntruss.com
+$DIND docker push "$IMG"
+$DIND docker logout vnxb4cz3.kr.private-ncr.ntruss.com
+
+# 3. Pods are immutable — recreate to roll out
 kubectl delete pod sangmin-gpu-monitor -n p-sgvr-node-02 --ignore-not-found
 kubectl apply -f k8s/gpu-monitor.yaml
 kubectl wait --for=condition=Ready pod/sangmin-gpu-monitor -n p-sgvr-node-02 --timeout=180s

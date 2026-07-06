@@ -46,6 +46,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+command -v kubectl >/dev/null 2>&1 || {
+  echo "sgpu: kubectl not found on PATH" >&2
+  echo "hint: see the 'Linux / WSL kubectl setup' section of the sgpu README" >&2
+  exit 127
+}
+
 hint_on_failure() {
   echo "sgpu: cannot reach monitor pod '$pod' in namespace '$namespace'" >&2
   printf '%s\n' "$1" | tail -n 3 >&2

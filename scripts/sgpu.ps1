@@ -17,6 +17,12 @@ param(
 $ErrorActionPreference = "Continue"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
+if (-not (Get-Command kubectl -ErrorAction SilentlyContinue)) {
+    Write-Host "sgpu: kubectl not found on PATH"
+    Write-Host "hint: install kubectl and configure the MLXP kubeconfig (see the sgpu README)"
+    exit 127
+}
+
 function Show-Usage {
     Write-Host @"
 usage: sgpu [command] [options]
