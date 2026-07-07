@@ -1,8 +1,9 @@
 """Render high-quality README images for SGPU.
 
 The generated files are SVGs, so they stay crisp on GitHub at any zoom level.
-When kubectl is configured, the script captures the current deployed SGPU
-output; otherwise it falls back to representative sample output.
+Samples are synthetic and anonymized by default. Set SGPU_README_LIVE=1 to
+capture the current monitor output through the local sgpu client before
+anonymizing it.
 """
 
 from __future__ import annotations
@@ -38,61 +39,91 @@ FAKE_CMDS = [
 
 SAMPLE_DASHBOARD = """SGPU  node=h200-04-w-4b11  driver=580.126.16  23:07:15 UTC (08:07 KST)
 
-GPU NAME      UTIL               MEM                        TEMP      POWER  OWNERS
-  0 H200      [████████░░]  78%  [██████░░░░] 78.6G/140.4G   55C   416/700W  atlas
-  1 H200      [░░░░░░░░░░]   0%  [░░░░░░░░░░] 0.6G/140.4G    31C    77/700W  -
-  2 H200      [░░░░░░░░░░]   0%  [░░░░░░░░░░] 0.6G/140.4G    30C    75/700W  -
-  3 H200      [██████████]  96%  [████░░░░░░] 61.6G/140.4G   60C   548/700W  nova
-  4 H200      [██████░░░░]  64%  [█████░░░░░] 73.8G/140.4G   63C   363/700W  atlas
-  5 H200      [████████░░]  82%  [█████░░░░░] 70.7G/140.4G   52C   401/700W  atlas
-  6 H200      [████████░░]  75%  [██████░░░░] 81.8G/140.4G   53C   408/700W  atlas
-  7 H200      [░░░░░░░░░░]   0%  [░░░░░░░░░░] 0.6G/140.4G    30C    77/700W  -
+GPU NAME      UTIL          MEM                    TEMP      POWER  OWNERS
+  0 H200      [########--]   78%  [######----] 78.6G/140.4G   55C   416/700W  atlas
+  1 H200      [----------]    0%  [----------]  0.6G/140.4G   31C    77/700W  -
+  2 H200      [----------]    0%  [----------]  0.6G/140.4G   30C    75/700W  -
+  3 H200      [##########]   96%  [####------] 61.6G/140.4G   60C   548/700W  nova
+  4 H200      [######----]   64%  [#####-----] 73.8G/140.4G   63C   363/700W  atlas
+  5 H200      [########--]   82%  [#####-----] 70.7G/140.4G   52C   401/700W  atlas
+  6 H200      [########--]   75%  [######----] 81.8G/140.4G   53C   408/700W  atlas
+  7 H200      [----------]    0%  [----------]  0.6G/140.4G   30C    77/700W  -
 
 NVIDIA compute processes
 GPU  OWNER     POD                                             PID   SM%      MEM       UP  CMD
-  0  atlas     atlas-vla-train-a                           12034      74    77.8G   21h38m  python train_vla.py
-  3  nova      nova-world-model-b                          12088      96    61.0G    1d20h  python train_world_model.py
-  4  atlas     atlas-vla-train-a                           12035      71    73.1G   21h38m  python train_vla.py
-  5  atlas     atlas-vla-train-a                           12036      78    70.0G   21h38m  python train_vla.py
-  6  atlas     atlas-vla-train-a                           12037      79    81.1G   21h38m  python train_vla.py
+  0  atlas     atlas-vla-train-a                             12034    74    77.8G   21h38m  python vla.py
+  3  nova      nova-world-model-b                            12035    96    61.0G    1d20h  python wm.py
+  4  atlas     atlas-vla-train-a                             12036    71    73.1G   21h38m  python eval.py
+  5  atlas     atlas-vla-train-a                             12037    78    70.0G   21h38m  python cache.py
+  6  atlas     atlas-vla-train-a                             12038    79    81.1G   21h38m  python nb.py
 
 Kubernetes GPU pods on this node
 OWNER     REQ  ACT  AGE      PHASE     POD
 nova        1    1  1d20h    Running   nova-world-model-b
 atlas       4    4  21h38m   Running   atlas-vla-train-a
 
-STORAGE pv-01/pv-02 [████████░░] 83.0%  34.8T/41.9T used, 7.1T free
+STORAGE pv-01/pv-02 [########--] 83.0%  34.8T/41.9T used, 7.1T free
+"""
+
+
+SAMPLE_MULTI_NODE = """=== p-sgvr-node-01 ===
+SGPU  node=h200-04-w-495c  driver=580.126.16  23:07:16 UTC (08:07 KST)
+
+GPU NAME      UTIL          MEM                    TEMP      POWER  OWNERS
+  0 H200      [----------]    0%  [----------]  0.6G/140.4G   31C    77/700W  -
+  1 H200      [#########-]   92%  [#####-----] 65.2G/140.4G   58C   522/700W  orion
+  2 H200      [----------]    0%  [----------]  0.6G/140.4G   30C    76/700W  -
+  3 H200      [----------]    0%  [----------]  0.6G/140.4G   30C    75/700W  -
+  4 H200      [########--]   81%  [#####-----] 66.0G/140.4G   54C   462/700W  orion
+  5 H200      [----------]    0%  [----------]  0.6G/140.4G   31C    78/700W  -
+  6 H200      [----------]    0%  [----------]  0.6G/140.4G   31C    78/700W  -
+  7 H200      [----------]    0%  [----------]  0.6G/140.4G   30C    77/700W  -
+
+=== p-sgvr-node-02 ===
+SGPU  node=h200-04-w-4b11  driver=580.126.16  23:07:17 UTC (08:07 KST)
+
+GPU NAME      UTIL          MEM                    TEMP      POWER  OWNERS
+  0 H200      [########--]   78%  [######----] 78.6G/140.4G   55C   416/700W  atlas
+  1 H200      [----------]    0%  [----------]  0.6G/140.4G   31C    77/700W  -
+  2 H200      [----------]    0%  [----------]  0.6G/140.4G   30C    75/700W  -
+  3 H200      [##########]   96%  [####------] 61.6G/140.4G   60C   548/700W  nova
+  4 H200      [######----]   64%  [#####-----] 73.8G/140.4G   63C   363/700W  atlas
+  5 H200      [########--]   82%  [#####-----] 70.7G/140.4G   52C   401/700W  atlas
+  6 H200      [########--]   75%  [######----] 81.8G/140.4G   53C   408/700W  atlas
+  7 H200      [----------]    0%  [----------]  0.6G/140.4G   30C    77/700W  -
 """
 
 
 SAMPLE_APPS = """NVIDIA compute processes
 GPU  OWNER     POD                                             PID   SM%      MEM       UP  CMD
-  0  atlas     atlas-vla-train-a                           12034      74    77.8G   21h38m  python train_vla.py
-  3  nova      nova-world-model-b                          12088      96    61.0G    1d20h  python train_world_model.py
-  4  atlas     atlas-vla-train-a                           12035      71    73.1G   21h38m  python train_vla.py
-  5  atlas     atlas-vla-train-a                           12036      78    70.0G   21h38m  python train_vla.py
-  6  atlas     atlas-vla-train-a                           12037      79    81.1G   21h38m  python train_vla.py
+  0  atlas     atlas-vla-train-a                             12034    74    77.8G   21h38m  python vla.py
+  3  nova      nova-world-model-b                            12035    96    61.0G    1d20h  python wm.py
+  4  atlas     atlas-vla-train-a                             12036    71    73.1G   21h38m  python eval.py
+  5  atlas     atlas-vla-train-a                             12037    78    70.0G   21h38m  python cache.py
+  6  atlas     atlas-vla-train-a                             12038    79    81.1G   21h38m  python nb.py
 """
 
 
 SAMPLE_STATS = """SGPU usage report - last 30 days
-data: 1 day, coverage 1.4h
+data: 7 days, coverage 99.2%
 
 Awards
-🏆 Best researcher: atlas - 4.3 effective GPU-h (75% avg over 5.7 GPU-h)
-⚡ Power user: atlas - 5.7 GPU-h
-🎯 Sharpshooter: atlas - 75% avg SM over 5.7 GPU-h
+* Best researcher: atlas - 123.4 effective GPU-h (76% avg over 162.4 GPU-h)
+* Power user: orion - 188.0 GPU-h
+* Sharpshooter: nova - 91% avg SM over 64.8 GPU-h
 
 Leaderboard
 OWNER     GPU-H  EFF-H  AVG-SM%  AVG-UTIL%  PEAK-MEM  ALLOC-H   IDLE-H  IDLE%
-atlas       5.7    4.3       75         75      81.1      5.7      0.0      0
-nova        1.4    1.4       97         97      61.0      1.4      0.0      0
+orion     188.0  132.5       70         73      91.2    188.0      3.2      2
+atlas     162.4  123.4       76         78      81.1    162.4      0.0      0
+nova       64.8   59.0       91         94      61.0     64.8      0.0      0
 
 KST hour activity (gpu-seconds share)
 KST      0     3     6     9     12    15    18    21
-atlas                ░░██..
-nova                 ░░██..
-TOTAL                ░░██..
+orion    ..::--==++**##%%##**++==--::..
+atlas       ..::--==++**##%%##**++==..
+nova              ..::--==++**##%%##..
+TOTAL    ..::--==++**##%%##%%##**++==..
 """
 
 
@@ -102,6 +133,8 @@ def strip_ansi(text: str) -> str:
 
 
 def capture(args: list[str], fallback: str) -> str:
+    if os.environ.get("SGPU_README_LIVE") != "1":
+        return fallback
     env = os.environ.copy()
     env.setdefault("PYTHONIOENCODING", "utf-8")
     try:
@@ -158,10 +191,10 @@ def discover_private_tokens(text: str) -> tuple[dict[str, str], dict[str, str]]:
         stat_row = re.match(r"^(\S+)\s+\d+(?:\.\d+)?\s+\d", line)
         if stat_row and not line.startswith(("GPU ", "OWNER", "KST")):
             add_owner(stat_row.group(1))
-        award = re.search(r":\s+([A-Za-z0-9_.-]+)\s+(?:-|—)", line)
+        award = re.search(r":\s+([A-Za-z0-9_.-]+)\s+-", line)
         if award:
             add_owner(award.group(1))
-        heatmap = re.match(r"^([A-Za-z0-9_.-]+)\s+[░█#.\- ]+$", line)
+        heatmap = re.match(r"^([A-Za-z0-9_.-]+)\s+[.#:\-=+*% ]+$", line)
         if heatmap:
             add_owner(heatmap.group(1))
 
@@ -189,7 +222,6 @@ def anonymize_process_line(line: str, row_index: int) -> str:
 def anonymize(text: str) -> str:
     text = strip_ansi(text)
     owner_map, pod_map = discover_private_tokens(text)
-    # Longer tokens first prevents partial replacement inside pod names.
     for real, fake in sorted(pod_map.items(), key=lambda item: -len(item[0])):
         text = re.sub(rf"(?<![A-Za-z0-9_.-]){re.escape(real)}(?![A-Za-z0-9_.-])", fake, text)
     for real, fake in sorted(owner_map.items(), key=lambda item: -len(item[0])):
@@ -206,14 +238,15 @@ def anonymize(text: str) -> str:
 
 
 def trim_lines(text: str, max_cols: int) -> list[str]:
-    lines = anonymize(text).splitlines()
+    rendered = anonymize(text) if os.environ.get("SGPU_README_LIVE") == "1" else strip_ansi(text)
+    lines = rendered.splitlines()
     return [line if len(line) <= max_cols else line[: max_cols - 1] + ">" for line in lines]
 
 
 def style_for(line: str) -> str:
     if line.startswith("SGPU"):
         return "title"
-    if line.startswith(("NVIDIA", "Kubernetes", "STORAGE", "Awards", "Leaderboard", "KST")):
+    if line.startswith(("===", "NVIDIA", "Kubernetes", "STORAGE", "Awards", "Leaderboard", "KST")):
         return "section"
     if line.startswith(("GPU ", "OWNER", "data:")):
         return "header"
@@ -225,7 +258,9 @@ def style_for(line: str) -> str:
         return "ownerA"
     if "nova" in line:
         return "ownerB"
-    if line.startswith(("🏆", "⚡", "🎯", "*")):
+    if "orion" in line:
+        return "ownerC"
+    if line.startswith("*"):
         return "award"
     return "plain"
 
@@ -238,6 +273,7 @@ COLORS = {
     "ok": "#34d399",
     "ownerA": "#93c5fd",
     "ownerB": "#fde68a",
+    "ownerC": "#a7f3d0",
     "award": "#facc15",
     "plain": "#d1d5db",
 }
@@ -299,6 +335,7 @@ def render_terminal_svg(
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     dashboard = capture(["python", "-m", "sgpu", "once", "--no-color"], SAMPLE_DASHBOARD)
+    multi = capture(["python", "-m", "sgpu", "--all", "once", "--no-color"], SAMPLE_MULTI_NODE)
     apps = capture(["python", "-m", "sgpu", "apps", "--no-color"], SAMPLE_APPS)
     stats = capture(["python", "-m", "sgpu", "stats", "30", "--no-color"], SAMPLE_STATS)
 
@@ -307,6 +344,14 @@ def main() -> None:
         subtitle="H200 node visibility from kubectl",
         body=dashboard,
         path=OUT / "sgpu-hero.svg",
+        width=1600,
+        max_cols=118,
+    )
+    render_terminal_svg(
+        title="Multi-node survey",
+        subtitle="sgpu --all once across both H200 nodes",
+        body=multi,
+        path=OUT / "sgpu-multinode.svg",
         width=1600,
         max_cols=118,
     )

@@ -9,6 +9,8 @@ another Kubernetes pod.
 </p>
 
 - Every GPU process is attributed to its **pod and owner**, not just a PID.
+- One client can survey **both H200 nodes** with `sgpu --all once`, or pick a
+  node with `sgpu -n 1` / `sgpu -n 2`.
 - **In-pod TUI** via `kubectl exec -it`: smooth refresh, scrolling, sorting,
   owner filtering, and a stats screen.
 - **Usage stats 24/7**: per-owner GPU-hours, awards, KST activity heatmaps,
@@ -25,7 +27,7 @@ pip install sgpu    # or plain pip (WSL/Ubuntu: add --user --break-system-packag
 ```
 
 Needs `kubectl` with an MLXP kubeconfig ([setup](#kubectl-setup-linuxwsl)).
-One kubeconfig covers **both** H200 servers — the two downloads
+One kubeconfig covers **both** H200 servers - the two downloads
 (`sgvr-node-01`/`-02`) share the same token and contexts, so either file
 works for every node.
 
@@ -69,10 +71,22 @@ Env: `SGPU_NAMESPACE`, `SGPU_POD`.
 
 ## Screenshots
 
+### Multi-node Survey
+
+<p align="center">
+  <img src="docs/images/sgpu-multinode.svg" alt="SGPU multi-node survey" width="100%">
+</p>
+
 ### Process Attribution
 
 <p align="center">
   <img src="docs/images/sgpu-processes.svg" alt="SGPU process attribution" width="100%">
+</p>
+
+### Usage Stats
+
+<p align="center">
+  <img src="docs/images/sgpu-stats.svg" alt="SGPU stats report" width="100%">
 </p>
 
 ## Zero Install
@@ -103,17 +117,13 @@ up daily summaries, and stores the results on the shared volume at
 Retention defaults to 365 days and is capped at 2 GB. `sgpu stats 30` shows
 leaderboards, awards, daily activity, and KST hour heatmaps.
 
-<p align="center">
-  <img src="docs/images/sgpu-stats.svg" alt="SGPU stats report" width="100%">
-</p>
-
 > The monitor pod must stay running for stats to accumulate. It is designed to
 > do that with tini init, `restartPolicy: Always`, and no GPU allocation.
 
 ## Deploy / Operate
 
 The monitor runs from a **public image** (`docker.io/alex6095/sgpu-monitor`),
-so no registry login or pull secret is needed. Deploy one pod per node —
+so no registry login or pull secret is needed. Deploy one pod per node -
 always pass `-n` (a bare `kubectl apply` would hit your current context's
 namespace):
 
@@ -144,7 +154,7 @@ docker build -f docker/Dockerfile.gpu-monitor -t docker.io/alex6095/sgpu-monitor
 docker push docker.io/alex6095/sgpu-monitor:X.Y.Z   # keep the repo public
 ```
 
-Bump the tag on every change — never repush a tag (`imagePullPolicy:
+Bump the tag on every change - never repush a tag (`imagePullPolicy:
 IfNotPresent` would keep a node's cached layer). The NVIDIA driver
 (580.126.16) is pinned in the image; if a node runs a different driver the
 server degrades to `source=nvidia-smi` or `/health` 503 instead of crashing.
@@ -157,7 +167,7 @@ mkdir -p ~/.local/bin ~/.kube
 V=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
 curl -fsSL -o ~/.local/bin/kubectl "https://dl.k8s.io/release/${V}/bin/linux/amd64/kubectl" && chmod +x ~/.local/bin/kubectl
 cp /path/to/sgvr-node-01-kubeconfig.yaml ~/.kube/config && chmod 600 ~/.kube/config
-# Either node's kubeconfig works for both — pick the node with `sgpu -n 1|2`.
+# Either node's kubeconfig works for both - pick the node with `sgpu -n 1|2`.
 kubectl get pods -n p-sgvr-node-02   # connectivity test
 ```
 
@@ -167,7 +177,8 @@ kubectl get pods -n p-sgvr-node-02   # connectivity test
 SGPU_MOCK=1 python3 tools/gpu-monitor/server.py   # full pipeline, no GPU needed
 SGPU_MOCK=1 python3 tools/gpu-monitor/tui.py
 python3 -m unittest discover -s tests
-python3 tools/render_readme_images.py
+python3 tools/render_readme_images.py        # synthetic public screenshots
+SGPU_README_LIVE=1 python3 tools/render_readme_images.py  # optional live capture
 ```
 
 How it works: `sgpu` is a thin Python client. It uses `kubectl exec` to reach

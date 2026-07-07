@@ -380,7 +380,7 @@ def _collect_smi():
 # --- mock mode ---------------------------------------------------------------
 
 
-_MOCK_OWNERS = ("sangmin", "yoonki", "joonsung")
+_MOCK_OWNERS = ("atlas", "nova", "orion")
 
 
 def _mock_snapshot(now):
