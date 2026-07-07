@@ -208,28 +208,45 @@ def build_rollup(day_path):
     day_path may be a .jsonl or .jsonl.gz path. Returns the rollup dict; on an
     absent/empty file returns a zeroed rollup with whatever date is in the name.
     """
+    return _build_rollup(day_path)
+
+
+def _build_rollup(day_path, idle_options=None):
     date_str = _date_from_path(day_path)
     roll = _empty_rollup(date_str)
 
     if not os.path.isfile(day_path):
+        if idle_options is not None:
+            return roll, []
         return roll
 
     # Two passes: first infer the interval hint (median gap), then accumulate.
-    # Both stream; we materialize timestamps only, not full records.
-    records = list(_iter_records(day_path))
-    interval_hint = _infer_interval_hint(records)
+    # Both stream; only timestamps are materialized by _infer_interval_hint.
+    interval_hint = _infer_interval_hint(_iter_records(day_path))
     roll["interval_hint"] = interval_hint
     dt_cap = 2.0 * interval_hint
 
     gpu_names = set()
     owners = roll["owners"]
     pods = roll["pods"]
+    idle_seen = {}
+    idle_proc_pods = set()
+    if idle_options is not None:
+        owner_filter, now_fn = idle_options
+        idle_now = now_fn().timestamp()
+        idle_window_start = idle_now - 30 * 60
+    else:
+        owner_filter = None
+        idle_now = None
+        idle_window_start = None
 
     prev_ts = None
-    for rec in records:
+    for rec in _iter_records(day_path):
         ts = _parse_ts(rec.get("ts"))
         if ts is None:
             continue
+        if idle_options is not None and ts >= idle_window_start:
+            _scan_idle_record(rec, ts, idle_seen, idle_proc_pods)
 
         if prev_ts is None:
             dt = float(interval_hint)
@@ -389,7 +406,17 @@ def build_rollup(day_path):
                 acc["idle_gpu_seconds"] += idle * dt
 
     roll["gpu_names"] = sorted(gpu_names)
+    if idle_options is not None:
+        return roll, _idle_rows(idle_seen, idle_proc_pods, idle_now,
+                                owner_filter)
     return roll
+
+
+def build_rollup_with_current_idle(day_path, owner_filter=None, now_fn=None):
+    """Build today's rollup and current-idle rows in one accumulation pass."""
+    if now_fn is None:
+        now_fn = lambda: datetime.now(timezone.utc)
+    return _build_rollup(day_path, idle_options=(owner_filter, now_fn))
 
 
 def _date_from_path(path):
@@ -506,6 +533,54 @@ def merge_rollups(rollups):
 
 # --- current idle detection -------------------------------------------------
 
+def _scan_idle_record(rec, ts, seen, procs_pods):
+    """Update idle-now state from one already-parsed raw sample."""
+    for p in rec.get("procs", []) or []:
+        pod = p.get("pod")
+        if pod is not None:
+            procs_pods.add(pod)
+
+    pod_rows = rec.get("pods")
+    if pod_rows is None:
+        return
+    for r in pod_rows:
+        if r.get("phase") != "Running":
+            continue
+        req = r.get("req") or 0
+        if req <= 0:
+            continue
+        podname = r.get("pod")
+        if podname is None:
+            continue
+        entry = seen.setdefault(podname, {
+            "owner": r.get("owner") if r.get("owner") is not None else NONE_OWNER,
+            "req": req,
+            "first_seen": ts,
+        })
+        if req > entry["req"]:
+            entry["req"] = req
+        if ts < entry["first_seen"]:
+            entry["first_seen"] = ts
+
+
+def _idle_rows(seen, procs_pods, now_epoch, owner_filter):
+    out = []
+    for pod, entry in seen.items():
+        if pod in procs_pods:
+            continue
+        if owner_filter is not None and entry["owner"] != owner_filter:
+            continue
+        idle_minutes = int(round((now_epoch - entry["first_seen"]) / 60.0))
+        out.append({
+            "pod": pod,
+            "owner": entry["owner"],
+            "req": entry["req"],
+            "idle_minutes": idle_minutes,
+        })
+    out.sort(key=lambda x: (-x["req"], x["pod"]))
+    return out
+
+
 def _current_idle(data_dir, today_str, owner_filter, now_fn):
     """Running GPU pods with zero attributed procs across the last ~30 min.
 
@@ -529,49 +604,9 @@ def _current_idle(data_dir, today_str, owner_filter, now_fn):
         ts = _parse_ts(rec.get("ts"))
         if ts is None or ts < window_start:
             continue
+        _scan_idle_record(rec, ts, seen, procs_pods)
 
-        for p in rec.get("procs", []) or []:
-            pod = p.get("pod")
-            if pod is not None:
-                procs_pods.add(pod)
-
-        pod_rows = rec.get("pods")
-        if pod_rows is None:
-            continue
-        for r in pod_rows:
-            if r.get("phase") != "Running":
-                continue
-            req = r.get("req") or 0
-            if req <= 0:
-                continue
-            podname = r.get("pod")
-            if podname is None:
-                continue
-            entry = seen.setdefault(podname, {
-                "owner": r.get("owner") if r.get("owner") is not None else NONE_OWNER,
-                "req": req,
-                "first_seen": ts,
-            })
-            if req > entry["req"]:
-                entry["req"] = req
-            if ts < entry["first_seen"]:
-                entry["first_seen"] = ts
-
-    out = []
-    for pod, entry in seen.items():
-        if pod in procs_pods:
-            continue
-        if owner_filter is not None and entry["owner"] != owner_filter:
-            continue
-        idle_minutes = int(round((now - entry["first_seen"]) / 60.0))
-        out.append({
-            "pod": pod,
-            "owner": entry["owner"],
-            "req": entry["req"],
-            "idle_minutes": idle_minutes,
-        })
-    out.sort(key=lambda x: (-x["req"], x["pod"]))
-    return out
+    return _idle_rows(seen, procs_pods, now, owner_filter)
 
 
 # --- query ------------------------------------------------------------------
@@ -605,6 +640,8 @@ def query(data_dir, days=7, owner=None, now_fn=None):
     rollups = []
     dates_covered = []
     daily = []
+    current_idle = []
+    current_idle_done = False
     for back in range(days - 1, -1, -1):
         d = today - timedelta(days=back)
         date_str = d.strftime("%Y%m%d")
@@ -622,7 +659,12 @@ def query(data_dir, days=7, owner=None, now_fn=None):
             raw = _raw_path_for(data_dir, date_str)
             if raw is not None:
                 try:
-                    roll = build_rollup(raw)
+                    if date_str == today_str:
+                        roll, current_idle = build_rollup_with_current_idle(
+                            raw, owner_filter=owner, now_fn=now_fn)
+                        current_idle_done = True
+                    else:
+                        roll = build_rollup(raw)
                 except Exception:
                     roll = None
 
@@ -645,7 +687,8 @@ def query(data_dir, days=7, owner=None, now_fn=None):
 
     merged = merge_rollups(rollups)
 
-    current_idle = _current_idle(data_dir, today_str, owner, now_fn)
+    if not current_idle_done:
+        current_idle = _current_idle(data_dir, today_str, owner, now_fn)
 
     # Structured awards so JSON consumers (the TUI stats view) don't have to
     # duplicate the threshold logic. Text format is "Title: owner — detail".
@@ -1173,15 +1216,14 @@ def iter_raw_lines(data_dir, date_str):
 
     Raises FileNotFoundError if neither the raw nor the gz file exists.
     """
-    raw = os.path.join(data_dir, "samples-%s.jsonl" % date_str)
-    gz = raw + ".gz"
-    if os.path.isfile(raw):
-        path = raw
-    elif os.path.isfile(gz):
-        path = gz
-    else:
+    path = _raw_path_for(data_dir, date_str)
+    if path is None:
         raise FileNotFoundError(
             "no samples file for %s in %s" % (date_str, data_dir))
-    with _open_text(path) as fh:
-        for line in fh:
-            yield line.rstrip("\n")
+
+    def _lines():
+        with _open_text(path) as fh:
+            for line in fh:
+                yield line.rstrip("\n")
+
+    return _lines()

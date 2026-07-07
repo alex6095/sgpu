@@ -9,7 +9,10 @@ gets the same dashboard. Plain text by default; ANSI color is opt-in via
 """
 
 import json
+import os
 import subprocess
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -25,6 +28,10 @@ except Exception as exc:  # never let a stats bug take monitoring down
     statsagg = None
     STATS_IMPORT_ERROR = "%s: %s" % (type(exc).__name__, exc)
 
+
+STATS_QUERY_CACHE_TTL = float(os.environ.get("SGPU_STATS_QUERY_CACHE_TTL", "10"))
+_STATS_QUERY_CACHE = {}
+_STATS_QUERY_LOCK = threading.Lock()
 
 def run_cmd(cmd, timeout=8):
     try:
@@ -48,6 +55,32 @@ def footer_notes():
     return notes
 
 
+def _stats_signature(data_dir):
+    if statsagg is None:
+        return ()
+    return tuple((f.get("name"), f.get("size"), f.get("mtime_iso"))
+                 for f in statsagg.list_files(data_dir))
+
+
+def query_stats_cached(data_dir, days, owner):
+    if STATS_QUERY_CACHE_TTL <= 0:
+        return statsagg.query(data_dir, days=days, owner=owner)
+    signature = _stats_signature(data_dir)
+    key = (data_dir, days, owner, signature)
+    now = time.time()
+    with _STATS_QUERY_LOCK:
+        entry = _STATS_QUERY_CACHE.get(key)
+        if entry is not None and now - entry[0] < STATS_QUERY_CACHE_TTL:
+            return entry[1]
+    result = statsagg.query(data_dir, days=days, owner=owner)
+    with _STATS_QUERY_LOCK:
+        for old_key, (at, _value) in list(_STATS_QUERY_CACHE.items()):
+            if now - at >= STATS_QUERY_CACHE_TTL:
+                del _STATS_QUERY_CACHE[old_key]
+        _STATS_QUERY_CACHE[key] = (now, result)
+    return result
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -63,6 +96,19 @@ class Handler(BaseHTTPRequestHandler):
     def send_json(self, code, payload):
         self.send_body(code, json.dumps(payload, indent=2, ensure_ascii=False),
                        "application/json")
+
+    def send_lines(self, code, lines,
+                   content_type="text/plain; charset=utf-8"):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        for line in lines:
+            data = line if isinstance(line, bytes) else line.encode("utf-8")
+            self.wfile.write(data)
+            self.wfile.write(b"\n")
 
     def do_GET(self):
         try:
@@ -159,18 +205,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_body(400, "usage: /stats/raw?date=YYYYMMDD\n")
                 return
             try:
-                body = "".join(statsagg.iter_raw_lines(data_dir, date))
+                lines = statsagg.iter_raw_lines(data_dir, date)
             except FileNotFoundError:
                 self.send_body(404, "no samples for %s\n" % date)
                 return
-            self.send_body(200, body, "application/x-ndjson; charset=utf-8")
+            self.send_lines(200, lines, "application/x-ndjson; charset=utf-8")
             return
         if path == "/stats":
             try:
                 days = max(1, min(365, int(q("days") or 7)))
             except ValueError:
                 days = 7
-            result = statsagg.query(data_dir, days=days, owner=q("owner"))
+            result = query_stats_cached(data_dir, days=days, owner=q("owner"))
             if q("format") == "json":
                 self.send_json(200, result)
                 return
