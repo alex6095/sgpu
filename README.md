@@ -227,7 +227,10 @@ Known limits: pods overriding `spec.hostname` and MPS may show as `?`.
 Troubleshooting:
 
 ```text
-broken terminal after dropped TUI -> reset
+TUI died with exit 137            -> the monitor pod was recreated (usually an
+                                     update rollout); sgpu >=0.7.3 restores the
+                                     terminal and reconnects by itself
+broken terminal after dropped TUI -> reset (older clients)
 frozen TUI                         -> rerun sgpu
 garbled bars                       -> Windows Terminal or --no-color
 ```

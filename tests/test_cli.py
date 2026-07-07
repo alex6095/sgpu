@@ -85,3 +85,63 @@ class TestAllRejectsInteractive(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _FakeTTY:
+    def __init__(self):
+        self.buffer = []
+
+    def write(self, text):
+        self.buffer.append(text)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return True
+
+
+class TestInteractiveReconnect(unittest.TestCase):
+    """The client must restore the terminal and reconnect after an abnormal
+    kubectl exec exit (e.g. 137 when the monitor pod is recreated)."""
+
+    def setUp(self):
+        self._stdout, self._stdin = sys.stdout, sys.stdin
+        sys.stdout = _FakeTTY()
+        sys.stdin = _FakeTTY()
+        self._call = cli.subprocess.call
+        self._running = cli._pod_running
+        self._sleep = cli.time.sleep
+        cli.time.sleep = lambda s: None
+        cli._pod_running = lambda ns, pod: True
+
+    def tearDown(self):
+        sys.stdout, sys.stdin = self._stdout, self._stdin
+        cli.subprocess.call = self._call
+        cli._pod_running = self._running
+        cli.time.sleep = self._sleep
+
+    def test_clean_exit_no_reconnect(self):
+        calls = []
+        cli.subprocess.call = lambda cmd: calls.append(cmd) or 0
+        self.assertEqual(cli._interactive("ns", "pod", ["x"], False), 0)
+        self.assertEqual(len(calls), 1)
+
+    def test_137_restores_terminal_and_reconnects(self):
+        codes = iter([137, 0])
+        calls = []
+        cli.subprocess.call = lambda cmd: calls.append(cmd) or next(codes)
+        self.assertEqual(cli._interactive("ns", "pod", ["x"], False), 0)
+        self.assertEqual(len(calls), 2)  # reconnected once
+        written = "".join(sys.stdout.buffer)
+        self.assertIn(cli._TERM_RESTORE, written)
+
+    def test_gives_up_after_max_retries(self):
+        cli.subprocess.call = lambda cmd: 137
+        self.assertEqual(cli._interactive("ns", "pod", ["x"], False), 137)
+
+    def test_ctrl_c_does_not_reconnect(self):
+        def raise_interrupt(cmd):
+            raise KeyboardInterrupt()
+        cli.subprocess.call = raise_interrupt
+        self.assertEqual(cli._interactive("ns", "pod", ["x"], False), 130)

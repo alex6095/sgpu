@@ -137,12 +137,63 @@ def _print(text):
             sys.stdout.write("\n")
 
 
+# Restore sequences for when the remote TUI dies without cleanup (pod
+# restart during an update, LB timeout -> SIGKILL): disable mouse
+# reporting, show the cursor, leave the alternate screen. Without this the
+# shell is left spewing mouse escape codes.
+_TERM_RESTORE = ("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"
+                 "\x1b[?25h\x1b[?1049l")
+_RECONNECT_TRIES = 5
+_POD_WAIT_SECONDS = 60
+
+
+def _pod_running(namespace, pod):
+    result = subprocess.run(
+        ["kubectl", "get", "pod", pod, "-n", namespace,
+         "-o", "jsonpath={.status.phase}"],
+        capture_output=True, text=True)
+    return result.returncode == 0 and result.stdout.strip() == "Running"
+
+
 def _interactive(namespace, pod, pod_command, no_color):
     if not (sys.stdout.isatty() and sys.stdin.isatty()):
         _print(_fetch(namespace, pod, "/table?color=0&" + _cols_param()))
         return 0
-    return subprocess.call(
-        ["kubectl", "exec", "-it", "-n", namespace, pod, "--"] + pod_command)
+    attempts = 0
+    while True:
+        try:
+            code = subprocess.call(
+                ["kubectl", "exec", "-it", "-n", namespace, pod, "--"]
+                + pod_command)
+        except KeyboardInterrupt:
+            code = 130
+        if code == 0:
+            return 0
+        # Abnormal end (137 = the in-pod process was SIGKILLed, e.g. the
+        # monitor pod was recreated for an update). First un-wedge the
+        # local terminal, then try to come back once the pod is Ready.
+        sys.stdout.write(_TERM_RESTORE)
+        sys.stdout.flush()
+        if code == 130:
+            return code
+        attempts += 1
+        if attempts > _RECONNECT_TRIES:
+            print("sgpu: connection lost %d times; giving up (exit %d)"
+                  % (attempts - 1, code), file=sys.stderr)
+            return code
+        print("sgpu: session ended unexpectedly (exit %d) — the monitor pod "
+              "probably restarted for an update. Reconnecting..."
+              % code, file=sys.stderr)
+        waited = 0
+        while waited < _POD_WAIT_SECONDS:
+            if _pod_running(namespace, pod):
+                break
+            time.sleep(2)
+            waited += 2
+        else:
+            _hint_on_failure(namespace, pod, "pod did not return to Running")
+            return code
+        time.sleep(1)  # let the server inside come up
 
 
 def _watch(namespace, pod, seconds, no_color):
