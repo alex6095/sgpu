@@ -1,8 +1,10 @@
+# Namespace is intentionally omitted so the same manifest deploys to any
+# node. ALWAYS pass it explicitly: kubectl apply -n <p-sgvr-node-01|-02> -f
+# (a bare apply would target your current kubectl context's namespace).
 apiVersion: v1
 kind: Service
 metadata:
   name: sangmin-gpu-monitor
-  namespace: p-sgvr-node-02
 spec:
   selector:
     app: sangmin-gpu-monitor
@@ -15,7 +17,6 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: sangmin-gpu-monitor
-  namespace: p-sgvr-node-02
   labels:
     app: sangmin-gpu-monitor
     owner: sangmin
@@ -25,8 +26,6 @@ spec:
   restartPolicy: Always
   priorityClassName: private-zone
   hostPID: true
-  imagePullSecrets:
-    - name: sangmin-ncr-pull
   nodeSelector:
     mlx.navercorp.com/zone: private-h200-sgvr-0
   volumes:
@@ -40,8 +39,9 @@ spec:
       persistentVolumeClaim:
         claimName: pv-01
     # Optional: lets the server list pods (allocated-vs-used view + stats).
-    # Create AFTER deploying, no pod restart needed:
-    #   kubectl -n p-sgvr-node-02 create secret generic sgpu-kubeconfig \
+    # Create AFTER deploying, no pod restart needed (use the SAME -n you
+    # deployed to):
+    #   kubectl -n <namespace> create secret generic sgpu-kubeconfig \
     #     --from-file=config=$HOME/.kube/config
     # SECURITY: anyone with exec access to this pod can read that token.
     - name: sgpu-kubeconfig
@@ -50,8 +50,11 @@ spec:
         optional: true
   containers:
     - name: monitor
-      image: vnxb4cz3.kr.private-ncr.ntruss.com/sangmin/gpu-monitor:nvml-580.126.16-v7
-      imagePullPolicy: Always
+      # Public image (Docker Hub) — no pull secret needed, works on any node.
+      # Driver 580.126.16 is pinned inside; bump the tag on every change
+      # (never repush a tag: IfNotPresent would keep a node's cached layer).
+      image: docker.io/alex6095/sgpu-monitor:0.7.0
+      imagePullPolicy: IfNotPresent
       securityContext:
         privileged: true
       env:
