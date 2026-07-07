@@ -386,15 +386,17 @@ class StatsFetcher(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self.lock = threading.Lock()
-        self.cache = {}          # days -> {"data", "error", "fetched_at"}
-        self.pending = set()     # days values awaiting a fetch
-        self.inflight = set()    # days currently being fetched
+        self.cache = {}          # (days, scope) -> {"data","error","fetched_at"}
+        self.pending = set()     # (days, scope) keys awaiting a fetch
+        self.inflight = set()    # (days, scope) currently being fetched
         self.wake = threading.Event()
 
-    def fetch_once(self, days):
+    def fetch_once(self, days, scope):
         url = "%s?days=%d&format=json" % (STATS_URL, int(days))
+        if scope == "lab":
+            url += "&scope=lab"
         try:
-            with urllib.request.urlopen(url, timeout=8) as response:
+            with urllib.request.urlopen(url, timeout=10) as response:
                 data = json.loads(response.read().decode("utf-8"))
             return data, None
         except Exception as exc:
@@ -408,42 +410,44 @@ class StatsFetcher(threading.Thread):
                 with self.lock:
                     todo = sorted(self.pending)
                     self.pending = set()
-                    for d in todo:
-                        self.inflight.add(d)
+                    for k in todo:
+                        self.inflight.add(k)
                 if not todo:
                     break
-                for days in todo:
-                    data, error = self.fetch_once(days)
+                for key in todo:
+                    days, scope = key
+                    data, error = self.fetch_once(days, scope)
                     with self.lock:
-                        self.inflight.discard(days)
-                        prev = self.cache.get(days)
+                        self.inflight.discard(key)
+                        prev = self.cache.get(key)
                         if data is not None:
-                            self.cache[days] = {
+                            self.cache[key] = {
                                 "data": data, "error": None,
                                 "fetched_at": time.time()}
                         else:
                             # keep stale data if we had some; record the error
-                            self.cache[days] = {
+                            self.cache[key] = {
                                 "data": prev.get("data") if prev else None,
                                 "error": error, "fetched_at": time.time()}
 
-    def request(self, days, force=False):
-        """Queue a fetch for `days` if not cached (or force=True)."""
-        days = int(days)
+    def request(self, days, scope="local", force=False):
+        """Queue a fetch for (days, scope) if not cached (or force=True)."""
+        key = (int(days), scope)
         with self.lock:
-            have = days in self.cache and self.cache[days].get("data")
+            have = key in self.cache and self.cache[key].get("data")
             if have and not force:
                 return
-            self.pending.add(days)
+            self.pending.add(key)
         self.wake.set()
 
-    def loading(self, days):
+    def loading(self, days, scope="local"):
+        key = (int(days), scope)
         with self.lock:
-            return int(days) in self.inflight or int(days) in self.pending
+            return key in self.inflight or key in self.pending
 
-    def get(self, days):
+    def get(self, days, scope="local"):
         with self.lock:
-            entry = self.cache.get(int(days))
+            entry = self.cache.get((int(days), scope))
             if not entry:
                 return None, None, 0.0
             return entry.get("data"), entry.get("error"), \
@@ -456,9 +460,14 @@ class StatsView:
     def __init__(self):
         self.mode = "hours"      # one of STATS_MODES
         self.offset = 0          # owner-row scroll within the grid
+        self.scope = "local"     # "local" (this node) or "lab" (all nodes)
 
     def days(self):
         return STATS_MODE_DAYS[self.mode]
+
+    def toggle_scope(self):
+        self.scope = "lab" if self.scope == "local" else "local"
+        self.offset = 0
 
     def cycle(self):
         self.mode = STATS_MODES[
@@ -598,11 +607,22 @@ def _fmt_num(value, spec="%.1f"):
     return spec % value
 
 
-def _leaderboard_rows(owners, width):
+def _owner_node_label(owner, owner_nodes):
+    """One node label if >=95% of the owner's time is there, else 'both'."""
+    per_node = (owner_nodes or {}).get(owner) or {}
+    total = sum(per_node.values())
+    if total <= 0:
+        return ""
+    label, best = max(per_node.items(), key=lambda kv: kv[1])
+    return label if best >= 0.95 * total else "both"
+
+
+def _leaderboard_rows(owners, width, owner_nodes=None):
     """Build (header_segments, [row_segments]) for the leaderboard.
 
-    Columns: OWNER (colored) GPU-H EFF-H AVG-SM% PEAK-MEM. Numbers right-
-    aligned; blank when the underlying weight is missing.
+    Columns: OWNER (colored) [NODE in lab scope] GPU-H EFF-H AVG-SM%
+    PEAK-MEM. Numbers right-aligned; blank when the underlying weight is
+    missing.
     """
     ow = 8
     if owners:
@@ -610,8 +630,10 @@ def _leaderboard_rows(owners, width):
     ranked = sorted(owners.items(),
                     key=lambda kv: -(kv[1].get("gpu_seconds", 0.0)
                                      if kv[1] else 0.0))
-    header = [("%-*s %7s %7s %8s %9s"
-               % (ow, "OWNER", "GPU-H", "EFF-H", "AVG-SM%", "PEAK-MEM"),
+    node_col = " %-7s" % "NODE" if owner_nodes is not None else ""
+    header = [("%-*s%s %7s %7s %8s %9s"
+               % (ow, "OWNER", node_col, "GPU-H", "EFF-H", "AVG-SM%",
+                  "PEAK-MEM"),
                "header")]
     rows = []
     for owner, acc in ranked:
@@ -630,10 +652,12 @@ def _leaderboard_rows(owners, width):
         peak_gib = acc.get("mem_peak_mib", 0) / 1024.0
         peak_s = "%.1f" % peak_gib if acc.get("mem_peak_mib") else ""
         name = render.clip(str(owner), ow).ljust(ow)
+        node_val = " %-7s" % _owner_node_label(owner, owner_nodes) \
+            if owner_nodes is not None else ""
         rows.append([
             (name, render.owner_tag(owner)),
-            (" %7s %7s %8s %9s"
-             % ("%.1f" % gpu_h, eff_s, sm_s, peak_s), "plain"),
+            ("%s %7s %7s %8s %9s"
+             % (node_val, "%.1f" % gpu_h, eff_s, sm_s, peak_s), "plain"),
         ])
     return header, rows
 
@@ -656,8 +680,8 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
                width, height):
     """Render the interactive STATS screen. Never raises on odd data."""
     days = statsview.days()
-    data, error, fetched_at = stats_fetcher.get(days)
-    loading = stats_fetcher.loading(days)
+    data, error, fetched_at = stats_fetcher.get(days, statsview.scope)
+    loading = stats_fetcher.loading(days, statsview.scope)
 
     stdscr.erase()
     y = 0
@@ -689,10 +713,13 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
     window_days = data.get("window_days", days)
     daily = data.get("daily") or []
     awards = data.get("awards") or []
+    owner_nodes = data.get("owner_nodes") if data.get("scope") == "lab" \
+        else None
 
     age = time.time() - fetched_at if fetched_at else 0.0
-    title = [("SGPU stats — last %d days — axis: %s"
-              % (window_days, axis_label), "title"),
+    scope_label = " — all nodes" if statsview.scope == "lab" else ""
+    title = [("SGPU stats — last %d days — axis: %s%s"
+              % (window_days, axis_label, scope_label), "title"),
              ("  (age %ds)" % int(age), "dim")]
     if loading:
         title.append(("  (loading…)", "dim"))
@@ -713,7 +740,7 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
         put([("", "plain")])
 
     # --- leaderboard (rows drop before the grid when space is tight) ---
-    lb_header, lb_rows = _leaderboard_rows(owners, width)
+    lb_header, lb_rows = _leaderboard_rows(owners, width, owner_nodes)
     show_leaderboard = height >= 12
     if show_leaderboard:
         put([("Leaderboard", "section")])
@@ -808,8 +835,10 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
 
 
 def _stats_footer(stdscr, curses, attrs, width, height, statsview):
-    footer = ("t dashboard  a axis:%s  h/d/w/m  j/k scroll  r refresh  "
-              "? help  q quit" % STATS_MODE_LABEL[statsview.mode])
+    footer = ("t dashboard  a axis:%s  h/d/w/m  n scope:%s  j/k scroll  "
+              "r refresh  ? help  q quit"
+              % (STATS_MODE_LABEL[statsview.mode],
+                 "LAB" if statsview.scope == "lab" else "LOCAL"))
     draw_segments(stdscr, curses, height - 1,
                   [(footer[:width - 1], "dim")], attrs, width)
 
@@ -830,6 +859,7 @@ def help_lines():
                   "(processes/pods) · s sort · o owner filter · p pause · "
                   "r refresh · t stats screen · ? help · q quit", "plain"))
     lines.append(("  stats screen: a or h/d/w/m axis (hour/day/week/month) · "
+                  "n scope local/lab (all nodes) · "
                   "j/k scroll owners · r refresh · t back to dashboard · "
                   "? help · q quit", "plain"))
     lines.append(("", "plain"))
@@ -995,7 +1025,7 @@ def run_tui(stdscr, curses, fetcher, view):
                 dirty = True
             height, width = size
             # lazily fetch the current mode's window on entry / mode switch
-            stats_fetcher.request(statsview.days())
+            stats_fetcher.request(statsview.days(), statsview.scope)
             data, _serr, _sat = stats_fetcher.get(statsview.days())
             owners = ((data or {}).get("merged") or {}).get("owners") or {}
             n_owners = len(owners)
@@ -1013,21 +1043,24 @@ def run_tui(stdscr, curses, fetcher, view):
                     continue
                 elif key == ord("a"):
                     statsview.cycle()
-                    stats_fetcher.request(statsview.days())
+                    stats_fetcher.request(statsview.days(), statsview.scope)
                 elif key == ord("h"):
                     statsview.set_mode("hours")
-                    stats_fetcher.request(statsview.days())
+                    stats_fetcher.request(statsview.days(), statsview.scope)
                 elif key == ord("d"):
                     statsview.set_mode("days")
-                    stats_fetcher.request(statsview.days())
+                    stats_fetcher.request(statsview.days(), statsview.scope)
                 elif key == ord("w"):
                     statsview.set_mode("weeks")
-                    stats_fetcher.request(statsview.days())
+                    stats_fetcher.request(statsview.days(), statsview.scope)
                 elif key == ord("m"):
                     statsview.set_mode("months")
-                    stats_fetcher.request(statsview.days())
+                    stats_fetcher.request(statsview.days(), statsview.scope)
+                elif key == ord("n"):
+                    statsview.toggle_scope()
+                    stats_fetcher.request(statsview.days(), statsview.scope)
                 elif key == ord("r"):
-                    stats_fetcher.request(statsview.days(), force=True)
+                    stats_fetcher.request(statsview.days(), statsview.scope, force=True)
                 elif key in (ord("j"), curses.KEY_DOWN):
                     statsview.scroll(1, n_owners, max(1, height - 8))
                 elif key in (ord("k"), curses.KEY_UP):
@@ -1086,7 +1119,7 @@ def run_tui(stdscr, curses, fetcher, view):
                 return
             elif key == ord("t"):
                 view.screen = "stats"
-                stats_fetcher.request(statsview.days())
+                stats_fetcher.request(statsview.days(), statsview.scope)
                 continue
             elif key == ord("?"):
                 help_open = True

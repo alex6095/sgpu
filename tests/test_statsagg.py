@@ -714,5 +714,275 @@ class TestUnicodeAsciiModes(unittest.TestCase):
         self.assertIn("yoonki", text)  # not truncated to "yoo"
 
 
+class TestLabMerge(unittest.TestCase):
+    """Lab-wide (multi-node) merge of per-node query() results."""
+
+    def _now(self):
+        return datetime(2026, 7, 7, 12, 0, 0, tzinfo=timezone.utc)
+
+    def _tbase(self):
+        return int(datetime(2026, 7, 7, 1, 0, 0,
+                            tzinfo=timezone.utc).timestamp())
+
+    def _node02(self, d, n_shared=200):
+        # node-02: "sujin" (only here) + "shared" (n_shared samples here).
+        base = self._tbase()
+        recs = []
+        for i in range(300):
+            procs = [proc(1, 0, "sujin", sm=75, mem=60000)]
+            if i < n_shared:
+                procs.append(proc(2, 1, "shared", sm=60, mem=50000))
+            recs.append(sample(ts_at(base, i * 15),
+                               gpus=[gpu(0, 80), gpu(1, 70)], procs=procs))
+        write_day(d, "20260707", recs)
+
+    def _node01(self, d, n_shared=200):
+        # node-01: "minho" (only here) + "shared" (n_shared samples here).
+        base = self._tbase()
+        recs = []
+        for i in range(150):
+            procs = [proc(1, 0, "minho", sm=30, mem=20000)]
+            if i < n_shared:
+                procs.append(proc(2, 0, "shared", sm=55, mem=15000))
+            recs.append(sample(ts_at(base, i * 15),
+                               gpus=[gpu(0, 40)], procs=procs))
+        write_day(d, "20260707", recs)
+
+    def _merge(self, n_shared_02=200, n_shared_01=200):
+        now = self._now()
+        with tempfile.TemporaryDirectory() as d1, \
+                tempfile.TemporaryDirectory() as d2:
+            self._node02(d1, n_shared=n_shared_02)
+            self._node01(d2, n_shared=n_shared_01)
+            local = statsagg.query(d1, days=1, now_fn=lambda: now)
+            peer = statsagg.query(d2, days=1, now_fn=lambda: now)
+        lab = statsagg.merge_query_results([("node-02", local),
+                                            ("node-01", peer)])
+        return local, peer, lab
+
+    def test_shared_owner_sums_disjoint_preserved(self):
+        local, peer, lab = self._merge()
+        owners = lab["merged"]["owners"]
+        # disjoint owners preserved.
+        self.assertIn("sujin", owners)
+        self.assertIn("minho", owners)
+        self.assertIn("shared", owners)
+        # shared owner's gpu_seconds = sum of both nodes' contributions.
+        s_local = local["merged"]["owners"]["shared"]["gpu_seconds"]
+        s_peer = peer["merged"]["owners"]["shared"]["gpu_seconds"]
+        self.assertAlmostEqual(owners["shared"]["gpu_seconds"],
+                               s_local + s_peer, places=6)
+        # sujin only on node-02, minho only on node-01.
+        self.assertAlmostEqual(
+            owners["sujin"]["gpu_seconds"],
+            local["merged"]["owners"]["sujin"]["gpu_seconds"], places=6)
+        self.assertAlmostEqual(
+            owners["minho"]["gpu_seconds"],
+            peer["merged"]["owners"]["minho"]["gpu_seconds"], places=6)
+
+    def test_owner_nodes_and_node_column(self):
+        # Give the shared owner meaningful time on both nodes (not lopsided).
+        local, peer, lab = self._merge()
+        on = lab["owner_nodes"]
+        # owner_nodes carries per-node gpu_seconds from each merged.owners.
+        self.assertAlmostEqual(
+            on["shared"]["node-02"],
+            local["merged"]["owners"]["shared"]["gpu_seconds"], places=6)
+        self.assertAlmostEqual(
+            on["shared"]["node-01"],
+            peer["merged"]["owners"]["shared"]["gpu_seconds"], places=6)
+        self.assertEqual(set(on["sujin"].keys()), {"node-02"})
+        self.assertEqual(set(on["minho"].keys()), {"node-01"})
+
+        text = statsagg.render_stats_text(lab, color=False)
+        self.assertIn("NODE", text)
+        # Isolate the leaderboard section (from "Leaderboard" to blank line) so
+        # we don't pick up KST heatmap rows that also start with an owner name.
+        all_lines = text.splitlines()
+        start = all_lines.index("Leaderboard")
+        rows = {}
+        for l in all_lines[start + 2:]:  # skip "Leaderboard" + header row
+            if l == "":
+                break
+            parts = l.split()
+            if parts and parts[0] in ("sujin", "minho", "shared"):
+                rows[parts[0]] = parts[1]  # NODE is the 2nd column
+        self.assertEqual(rows["sujin"], "node-02")   # single-node owner
+        self.assertEqual(rows["minho"], "node-01")   # single-node owner
+        self.assertEqual(rows["shared"], "both")     # split across both nodes
+
+    def test_node_column_95pct_threshold(self):
+        # Shared owner almost entirely on node-02 (>=95%) -> shows that label.
+        # node-02 has 300 shared samples on 1 gpu; node-01 has ~5 -> ~98%.
+        local, peer, lab = self._merge(n_shared_02=300, n_shared_01=5)
+        label = statsagg._owner_node_label("shared", lab["owner_nodes"])
+        self.assertEqual(label, "node-02")
+
+    def test_daily_union_sum_and_max_coverage(self):
+        local, peer, lab = self._merge()
+        daily = lab["daily"]
+        # single shared date.
+        self.assertEqual([e["date"] for e in daily], ["20260707"])
+        day = daily[0]
+        # per-date owner sums across nodes.
+        l0 = local["daily"][0]["owners"]
+        p0 = peer["daily"][0]["owners"]
+        expected_shared = l0.get("shared", 0.0) + p0.get("shared", 0.0)
+        self.assertAlmostEqual(day["owners"]["shared"], expected_shared,
+                               places=6)
+        self.assertAlmostEqual(day["owners"]["sujin"], l0["sujin"], places=6)
+        self.assertAlmostEqual(day["owners"]["minho"], p0["minho"], places=6)
+        # coverage = MAX across nodes for the date (parallel monitors).
+        expected_cov = max(local["daily"][0]["coverage_seconds"],
+                           peer["daily"][0]["coverage_seconds"])
+        self.assertAlmostEqual(day["coverage_seconds"], expected_cov, places=6)
+
+    def test_daily_date_union_across_nodes(self):
+        # node-02 has today; node-01 has yesterday+today -> union is both dates.
+        now = self._now()
+        ybase = int(datetime(2026, 7, 6, 1, 0, 0,
+                             tzinfo=timezone.utc).timestamp())
+        tbase = self._tbase()
+        with tempfile.TemporaryDirectory() as d1, \
+                tempfile.TemporaryDirectory() as d2:
+            # node-02: only today.
+            write_day(d1, "20260707",
+                      [sample(ts_at(tbase, i * 15), gpus=[gpu(0, 50)],
+                              procs=[proc(1, 0, "sujin")]) for i in range(4)])
+            # node-01: yesterday and today.
+            write_day(d2, "20260706",
+                      [sample(ts_at(ybase, i * 15), gpus=[gpu(0, 50)],
+                              procs=[proc(1, 0, "minho")]) for i in range(4)])
+            write_day(d2, "20260707",
+                      [sample(ts_at(tbase, i * 15), gpus=[gpu(0, 50)],
+                              procs=[proc(1, 0, "minho")]) for i in range(4)])
+            local = statsagg.query(d1, days=2, now_fn=lambda: now)
+            peer = statsagg.query(d2, days=2, now_fn=lambda: now)
+        lab = statsagg.merge_query_results([("node-02", local),
+                                            ("node-01", peer)])
+        self.assertEqual([e["date"] for e in lab["daily"]],
+                         ["20260706", "20260707"])
+        self.assertEqual(lab["dates_covered"], ["20260706", "20260707"])
+
+    def test_awards_recomputed_over_merged_owners(self):
+        # node-02 alone: sujin is the power user (most GPU-h locally).
+        # node-01 alone: minho is the power user locally.
+        # After merge, "shared" gets time from BOTH nodes -> flips power user.
+        now = self._now()
+        tbase = self._tbase()
+        with tempfile.TemporaryDirectory() as d1, \
+                tempfile.TemporaryDirectory() as d2:
+            # node-02: sujin heavy, shared moderate.
+            recs02 = [sample(ts_at(tbase, i * 15),
+                             gpus=[gpu(0, 80), gpu(1, 70)],
+                             procs=[proc(1, 0, "sujin", sm=75),
+                                    proc(2, 1, "shared", sm=60)])
+                      for i in range(300)]
+            write_day(d1, "20260707", recs02)
+            # node-01: minho heavy, shared moderate.
+            recs01 = [sample(ts_at(tbase, i * 15),
+                             gpus=[gpu(0, 40), gpu(1, 40)],
+                             procs=[proc(1, 0, "minho", sm=30),
+                                    proc(2, 1, "shared", sm=55)])
+                      for i in range(300)]
+            write_day(d2, "20260707", recs01)
+            local = statsagg.query(d1, days=1, now_fn=lambda: now)
+            peer = statsagg.query(d2, days=1, now_fn=lambda: now)
+
+        # sanity: locally the power user is the single-node heavy owner.
+        local_power = {a["key"]: a["owner"] for a in local["awards"]}
+        self.assertEqual(local_power.get("power"), "sujin")
+
+        lab = statsagg.merge_query_results([("node-02", local),
+                                            ("node-01", peer)])
+        lab_power = {a["key"]: a["owner"] for a in lab["awards"]}
+        # "shared" now has GPU-h from both nodes -> most total -> power user.
+        self.assertEqual(lab_power.get("power"), "shared")
+
+    def test_current_idle_entries_carry_node(self):
+        now = self._now()
+        tbase = self._tbase()
+        pods02 = [{"pod": "sujin-idle", "owner": "sujin", "req": 4,
+                   "phase": "Running", "start": ts_at(tbase, -3600)}]
+        pods01 = [{"pod": "minho-idle", "owner": "minho", "req": 2,
+                   "phase": "Running", "start": ts_at(tbase, -3600)}]
+        with tempfile.TemporaryDirectory() as d1, \
+                tempfile.TemporaryDirectory() as d2:
+            write_day(d1, "20260707", [
+                sample(ts_at(now.timestamp(), -600), gpus=[gpu(0, 0)],
+                       procs=[], pods=pods02),
+                sample(ts_at(now.timestamp(), -300), gpus=[gpu(0, 0)],
+                       procs=[], pods=pods02)])
+            write_day(d2, "20260707", [
+                sample(ts_at(now.timestamp(), -600), gpus=[gpu(0, 0)],
+                       procs=[], pods=pods01),
+                sample(ts_at(now.timestamp(), -300), gpus=[gpu(0, 0)],
+                       procs=[], pods=pods01)])
+            local = statsagg.query(d1, days=1, now_fn=lambda: now)
+            peer = statsagg.query(d2, days=1, now_fn=lambda: now)
+        lab = statsagg.merge_query_results([("node-02", local),
+                                            ("node-01", peer)])
+        idle = lab["current_idle"]
+        by_pod = {e["pod"]: e for e in idle}
+        self.assertEqual(by_pod["sujin-idle"]["node"], "node-02")
+        self.assertEqual(by_pod["minho-idle"]["node"], "node-01")
+        # IDLE-NOW warning line includes the node.
+        text = statsagg.render_stats_text(lab, color=False)
+        self.assertIn("IDLE-NOW pod sujin-idle (4 GPU, node-02)", text)
+
+    def test_lab_title_and_notes(self):
+        local, peer, lab = self._merge()
+        lab["notes"] = ["node-01 unreachable: timeout"]
+        text = statsagg.render_stats_text(lab, color=False)
+        self.assertIn("all nodes", text)
+        self.assertIn("(node-02+node-01)", text)
+        # notes render at the very bottom.
+        self.assertIn("node-01 unreachable: timeout", text)
+
+    def test_non_lab_render_unchanged_no_node_column(self):
+        # A plain (non-lab) query() result must render with no NODE column.
+        now = self._now()
+        tbase = self._tbase()
+        with tempfile.TemporaryDirectory() as d:
+            write_day(d, "20260707",
+                      [sample(ts_at(tbase, i * 15), gpus=[gpu(0, 50)],
+                              procs=[proc(1, 0, "a")]) for i in range(4)])
+            result = statsagg.query(d, days=1, now_fn=lambda: now)
+        text = statsagg.render_stats_text(result, color=False)
+        self.assertNotIn("scope", result)
+        self.assertNotIn("NODE", text)
+        self.assertNotIn("all nodes", text)
+
+    def test_single_entry_merge(self):
+        # Only the local node -> still scope "lab" with one label.
+        now = self._now()
+        with tempfile.TemporaryDirectory() as d1:
+            self._node02(d1)
+            local = statsagg.query(d1, days=1, now_fn=lambda: now)
+        lab = statsagg.merge_query_results([("node-02", local)])
+        self.assertEqual(lab["scope"], "lab")
+        self.assertEqual(lab["node_labels"], ["node-02"])
+        # merged owners match the single node's owners.
+        self.assertEqual(set(lab["merged"]["owners"].keys()),
+                         set(local["merged"]["owners"].keys()))
+        text = statsagg.render_stats_text(lab, color=False)
+        self.assertIn("all nodes (node-02)", text)
+
+    def test_malformed_entry_skipped_label_dropped(self):
+        # A falsy/malformed result is skipped; its label is not in node_labels.
+        now = self._now()
+        with tempfile.TemporaryDirectory() as d1:
+            self._node02(d1)
+            local = statsagg.query(d1, days=1, now_fn=lambda: now)
+        lab = statsagg.merge_query_results([
+            ("node-02", local),
+            ("node-01", None),      # unreachable peer -> falsy
+            ("node-03", "garbage"),  # malformed -> not a dict
+        ])
+        self.assertEqual(lab["node_labels"], ["node-02"])
+        # merge over the one valid result still works.
+        self.assertIn("sujin", lab["merged"]["owners"])
+
+
 if __name__ == "__main__":
     unittest.main()

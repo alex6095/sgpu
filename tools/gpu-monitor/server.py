@@ -13,8 +13,9 @@ import os
 import subprocess
 import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 
 import collector
 import render
@@ -32,6 +33,50 @@ except Exception as exc:  # never let a stats bug take monitoring down
 STATS_QUERY_CACHE_TTL = float(os.environ.get("SGPU_STATS_QUERY_CACHE_TTL", "10"))
 _STATS_QUERY_CACHE = {}
 _STATS_QUERY_LOCK = threading.Lock()
+
+# Lab-wide stats: peer monitors, "label=url,label=url". The entry matching
+# our own namespace is skipped, so the same value works on every node.
+POD_NAMESPACE = os.environ.get("POD_NAMESPACE", "")
+SGPU_PEERS = os.environ.get("SGPU_PEERS", "")
+
+
+def self_node_label():
+    ns = POD_NAMESPACE
+    idx = ns.find("node-")
+    return ns[idx:] if idx >= 0 else (ns or "local")
+
+
+def peer_monitors():
+    peers = []
+    for part in SGPU_PEERS.split(","):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        label, _, url = part.partition("=")
+        label = label.strip()
+        if label and label != self_node_label():
+            peers.append((label, url.strip().rstrip("/")))
+    return peers
+
+
+def lab_stats(local_result, days, owner):
+    """Merge the local query result with every reachable peer's."""
+    labeled = [(self_node_label(), local_result)]
+    notes = []
+    for label, url in peer_monitors():
+        peer_url = "%s/stats?days=%d&format=json" % (url, days)
+        if owner:
+            peer_url += "&owner=" + quote(owner)
+        try:
+            with urllib.request.urlopen(peer_url, timeout=6) as resp:
+                labeled.append((label,
+                                json.loads(resp.read().decode("utf-8"))))
+        except Exception as exc:
+            notes.append("%s unreachable: %s" % (label, exc))
+    merged = statsagg.merge_query_results(labeled)
+    if notes:
+        merged["notes"] = notes
+    return merged
 
 def run_cmd(cmd, timeout=8):
     try:
@@ -217,6 +262,8 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 days = 7
             result = query_stats_cached(data_dir, days=days, owner=q("owner"))
+            if q("scope") == "lab":
+                result = lab_stats(result, days, q("owner"))
             if q("format") == "json":
                 self.send_json(200, result)
                 return

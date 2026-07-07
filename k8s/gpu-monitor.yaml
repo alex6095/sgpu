@@ -53,7 +53,7 @@ spec:
       # Public image (Docker Hub) - no pull secret needed, works on any node.
       # Driver 580.126.16 is pinned inside; bump the tag on every change
       # (never repush a tag: IfNotPresent would keep a node's cached layer).
-      image: docker.io/alex6095/sgpu-monitor:0.7.2
+      image: docker.io/alex6095/sgpu-monitor:0.8.0
       imagePullPolicy: IfNotPresent
       securityContext:
         privileged: true
@@ -76,6 +76,10 @@ spec:
           value: /var/lib/sgpu
         - name: SGPU_SAMPLE_INTERVAL
           value: "15"
+        # Lab-wide stats (/stats?scope=lab): every node's monitor, same value
+        # everywhere — the server skips the entry matching its own namespace.
+        - name: SGPU_PEERS
+          value: "node-01=http://sangmin-gpu-monitor.p-sgvr-node-01.svc.cluster.local:8080,node-02=http://sangmin-gpu-monitor.p-sgvr-node-02.svc.cluster.local:8080"
       command:
         - tini
         - --

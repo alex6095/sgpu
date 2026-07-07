@@ -690,23 +690,10 @@ def query(data_dir, days=7, owner=None, now_fn=None):
     if not current_idle_done:
         current_idle = _current_idle(data_dir, today_str, owner, now_fn)
 
-    # Structured awards so JSON consumers (the TUI stats view) don't have to
-    # duplicate the threshold logic. Text format is "Title: owner — detail".
-    awards = []
-    for key, own, text in _compute_awards(
-            merged.get("owners") or {},
-            merged.get("pods_coverage_seconds", 0.0),
-            merged.get("coverage_seconds", 0.0)):
-        title, _, rest = text.partition(": ")
-        _owner_part, sep, detail = rest.partition(" — ")
-        awards.append({
-            "key": key,
-            "icon": _award_prefix(key, True),
-            "ascii": _award_prefix(key, False),
-            "title": title,
-            "owner": own,
-            "detail": detail if sep else rest,
-        })
+    awards = _awards_struct(
+        merged.get("owners") or {},
+        merged.get("pods_coverage_seconds", 0.0),
+        merged.get("coverage_seconds", 0.0))
 
     return {
         "window_days": days,
@@ -716,6 +703,111 @@ def query(data_dir, days=7, owner=None, now_fn=None):
         "daily": daily,
         "awards": awards,
         "generated_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+# --- lab-wide (multi-node) merge --------------------------------------------
+
+def merge_query_results(labeled_results):
+    """Merge N per-node query() results into one lab-wide result.
+
+    Input: list of (node_label, query_result_dict) tuples, e.g.
+    [("node-02", local), ("node-01", peer)]. Labels are short strings.
+    Entries whose dict is falsy/malformed are skipped (their label is kept out
+    of node_labels).
+
+    Returns a dict with the SAME shape as query()'s return (so
+    render_stats_text and JSON consumers work unchanged) plus lab-wide fields:
+    "scope", "node_labels", "owner_nodes". The per-owner "owner_nodes" carries
+    node affiliation so the report can show which node each person works on.
+    """
+    node_labels = []
+    valid = []  # (label, result) pairs that contributed
+    for label, res in labeled_results or []:
+        if not res or not isinstance(res, dict):
+            continue
+        node_labels.append(label)
+        valid.append((label, res))
+
+    # merged: element-wise merge of each result's (rollup-shaped) "merged".
+    merged = merge_rollups([res.get("merged") for _lbl, res in valid])
+
+    # owner_nodes: {owner: {label: gpu_seconds}} from each merged.owners.
+    owner_nodes = {}
+    for label, res in valid:
+        rmerged = res.get("merged") or {}
+        for owner, acc in (rmerged.get("owners") or {}).items():
+            owner_nodes.setdefault(owner, {})[label] = \
+                acc.get("gpu_seconds", 0.0)
+
+    # daily: union by date (oldest->newest). Per date, sum owners' gpu_seconds
+    # across nodes; coverage_seconds = MAX across nodes for that date (parallel
+    # monitors run concurrently, so their wall-clock coverage does not add).
+    daily_by_date = {}   # date -> {"owners": {...}, "coverage_seconds": float}
+    date_order = []
+    for _label, res in valid:
+        for d in res.get("daily") or []:
+            date = d.get("date")
+            if date is None:
+                continue
+            if date not in daily_by_date:
+                daily_by_date[date] = {"owners": {}, "coverage_seconds": 0.0}
+                date_order.append(date)
+            slot = daily_by_date[date]
+            for own, gs in (d.get("owners") or {}).items():
+                slot["owners"][own] = slot["owners"].get(own, 0.0) + gs
+            cov = d.get("coverage_seconds", 0.0)
+            if cov > slot["coverage_seconds"]:
+                slot["coverage_seconds"] = cov
+    daily = []
+    for date in sorted(date_order):
+        slot = daily_by_date[date]
+        daily.append({
+            "date": date,
+            "owners": slot["owners"],
+            "coverage_seconds": slot["coverage_seconds"],
+        })
+
+    # current_idle: concatenation, tagging each entry with its node label.
+    current_idle = []
+    for label, res in valid:
+        for entry in res.get("current_idle") or []:
+            e = dict(entry)
+            e["node"] = label
+            current_idle.append(e)
+
+    # awards: recomputed lab-wide over the merged owners.
+    awards = _awards_struct(
+        merged.get("owners") or {},
+        merged.get("pods_coverage_seconds", 0.0),
+        merged.get("coverage_seconds", 0.0))
+
+    # window_days: max of inputs; dates_covered: sorted union; generated_utc:
+    # max of inputs (ISO Z strings sort chronologically under string compare).
+    window_days = 0
+    dates_covered = set()
+    generated_utc = ""
+    for _label, res in valid:
+        wd = res.get("window_days", 0) or 0
+        if wd > window_days:
+            window_days = wd
+        for ds in res.get("dates_covered") or []:
+            dates_covered.add(ds)
+        gu = res.get("generated_utc") or ""
+        if gu > generated_utc:
+            generated_utc = gu
+
+    return {
+        "window_days": window_days,
+        "dates_covered": sorted(dates_covered),
+        "merged": merged,
+        "current_idle": current_idle,
+        "daily": daily,
+        "awards": awards,
+        "generated_utc": generated_utc,
+        "scope": "lab",
+        "node_labels": node_labels,
+        "owner_nodes": owner_nodes,
     }
 
 
@@ -752,6 +844,24 @@ def _clip(s, width):
     if len(s) <= width:
         return s
     return s[:width]
+
+
+def _owner_node_label(owner, owner_nodes):
+    """Which node an owner belongs to for the NODE column.
+
+    Returns the single label if >= 95% of that owner's summed gpu_seconds is on
+    one node, else "both"; "" when the owner is missing from owner_nodes.
+    """
+    per_node = (owner_nodes or {}).get(owner)
+    if not per_node:
+        return ""
+    total = sum(per_node.values())
+    if total <= 0:
+        return ""
+    top_label, top_gs = max(per_node.items(), key=lambda kv: kv[1])
+    if top_gs / total >= 0.95:
+        return top_label
+    return "both"
 
 
 def _bucket_level(value, mx, nlevels):
@@ -932,6 +1042,28 @@ def _award_prefix(key, unicode_ok):
     return ""
 
 
+def _awards_struct(owners, pods_cov, coverage_seconds):
+    """Build the structured awards list (dicts) from owner accumulators.
+
+    Structured awards so JSON consumers (the TUI stats view) don't have to
+    duplicate the threshold logic. Text format is "Title: owner — detail".
+    Split out so the lab merge can recompute awards over merged owners.
+    """
+    awards = []
+    for key, own, text in _compute_awards(owners, pods_cov, coverage_seconds):
+        title, _, rest = text.partition(": ")
+        _owner_part, sep, detail = rest.partition(" — ")
+        awards.append({
+            "key": key,
+            "icon": _award_prefix(key, True),
+            "ascii": _award_prefix(key, False),
+            "title": title,
+            "owner": own,
+            "detail": detail if sep else rest,
+        })
+    return awards
+
+
 def render_stats_text(result, color=False, width=100, unicode_ok=True):
     """Render a query() result to a plain (or minimally ANSI) text report."""
     merged = result.get("merged") or _empty_rollup("")
@@ -942,12 +1074,18 @@ def render_stats_text(result, color=False, width=100, unicode_ok=True):
     coverage_h = merged.get("coverage_seconds", 0.0) / 3600.0
     coverage_seconds = merged.get("coverage_seconds", 0.0)
     pods_cov = merged.get("pods_coverage_seconds", 0.0)
+    owner_nodes = result.get("owner_nodes")
 
     lines = []
 
     # --- a. title + subtitle ---
-    lines.append(_c("cyan", _c("bold", "SGPU usage report — last %d days"
-                               % window_days, color), color))
+    if result.get("scope") == "lab":
+        node_labels = result.get("node_labels") or []
+        title = ("SGPU usage report — last %d days — all nodes (%s)"
+                 % (window_days, "+".join(node_labels)))
+    else:
+        title = "SGPU usage report — last %d days" % window_days
+    lines.append(_c("cyan", _c("bold", title, color), color))
     day_word = "day" if len(dates) == 1 else "days"
     subtitle = "data: %d %s, coverage %.1fh" % (len(dates), day_word, coverage_h)
     lines.append(_c("dim", subtitle, color))
@@ -972,10 +1110,21 @@ def render_stats_text(result, color=False, width=100, unicode_ok=True):
         lines.append("")
 
     # --- c. leaderboard ---
+    # When the result carries per-owner node affiliation (lab merge), add a
+    # NODE column right after OWNER so the report shows which node each person
+    # works on. Its width fits the labels (min 4 for the "NODE"/"both" header).
+    show_node = owner_nodes is not None
+    if show_node:
+        nw = max([4] + [len(_owner_node_label(o, owner_nodes)) for o in owners])
     lines.append(_c("bold", "Leaderboard", color))
-    header = ("%-*s %6s %6s %8s %10s %9s %8s %8s %6s"
-              % (ow, "OWNER", "GPU-H", "EFF-H", "AVG-SM%", "AVG-UTIL%",
-                 "PEAK-MEM", "ALLOC-H", "IDLE-H", "IDLE%"))
+    if show_node:
+        header = ("%-*s %-*s %6s %6s %8s %10s %9s %8s %8s %6s"
+                  % (ow, "OWNER", nw, "NODE", "GPU-H", "EFF-H", "AVG-SM%",
+                     "AVG-UTIL%", "PEAK-MEM", "ALLOC-H", "IDLE-H", "IDLE%"))
+    else:
+        header = ("%-*s %6s %6s %8s %10s %9s %8s %8s %6s"
+                  % (ow, "OWNER", "GPU-H", "EFF-H", "AVG-SM%", "AVG-UTIL%",
+                     "PEAK-MEM", "ALLOC-H", "IDLE-H", "IDLE%"))
     lines.append(_c("bold", header, color))
 
     for owner, acc in ranked:
@@ -1004,9 +1153,15 @@ def render_stats_text(result, color=False, width=100, unicode_ok=True):
             idle_s = ""
             idlep_s = ""
 
-        row = ("%-*s %6s %6s %8s %10s %9s %8s %8s %6s"
-               % (ow, _clip(owner, ow), "%.1f" % gpu_h, eff_s, sm_s, util_s,
-                  peak_s, alloc_s, idle_s, idlep_s))
+        if show_node:
+            node_s = _owner_node_label(owner, owner_nodes)
+            row = ("%-*s %-*s %6s %6s %8s %10s %9s %8s %8s %6s"
+                   % (ow, _clip(owner, ow), nw, node_s, "%.1f" % gpu_h, eff_s,
+                      sm_s, util_s, peak_s, alloc_s, idle_s, idlep_s))
+        else:
+            row = ("%-*s %6s %6s %8s %10s %9s %8s %8s %6s"
+                   % (ow, _clip(owner, ow), "%.1f" % gpu_h, eff_s, sm_s, util_s,
+                      peak_s, alloc_s, idle_s, idlep_s))
         lines.append(row)
 
     if pods_cov == 0:
@@ -1067,8 +1222,11 @@ def render_stats_text(result, color=False, width=100, unicode_ok=True):
                             % (owner, eff, gpu_h))
 
     for entry in result.get("current_idle") or []:
-        warnings.append("IDLE-NOW pod %s (%d GPU) idle %dm"
-                        % (entry.get("pod"), entry.get("req", 0),
+        node = entry.get("node")
+        gpu_part = ("%d GPU, %s" % (entry.get("req", 0), node) if node
+                    else "%d GPU" % entry.get("req", 0))
+        warnings.append("IDLE-NOW pod %s (%s) idle %dm"
+                        % (entry.get("pod"), gpu_part,
                            entry.get("idle_minutes", 0)))
 
     if warnings:
@@ -1076,6 +1234,10 @@ def render_stats_text(result, color=False, width=100, unicode_ok=True):
         for w in warnings:
             lines.append(_c("yellow", "  " + w, color))
         lines.append("")
+
+    # --- g. notes (e.g. server-added "node-01 unreachable: ...") ---
+    for note in result.get("notes") or []:
+        lines.append(_c("dim", note, color))
 
     # Drop a trailing blank line for tidiness.
     while lines and lines[-1] == "":

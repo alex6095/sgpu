@@ -279,6 +279,18 @@ def main(argv=None):
 
     path = _text_path(args.command, args.number, args.no_color)
 
+    if args.all and args.command == "stats":
+        # One lab-wide merged report (any reachable monitor renders it by
+        # pulling its peers' data server-side) — not two separate reports.
+        preferred = _resolve_namespace(args.namespace)
+        for ns in [preferred] + [n for n in NODES if n != preferred]:
+            text = _fetch(ns, args.pod, path + "&scope=lab", quiet=True)
+            if text is not None:
+                _print(text)
+                return 0
+        print("sgpu: no reachable monitor pod on any node", file=sys.stderr)
+        return 1
+
     if args.all:
         succeeded = False
         for ns in NODES:

@@ -48,8 +48,13 @@ MLXP has two H200 servers (`p-sgvr-node-01`, `p-sgvr-node-02`):
 sgpu -n 1 once        node-01   (shorthand for p-sgvr-node-01)
 sgpu -n 2 once        node-02
 sgpu --all once       survey both nodes at once (any text command)
+sgpu --all stats      ONE lab-wide merged report: combined leaderboard,
+                      awards and heatmaps with a NODE column per owner
 sgpu once             uses your current kubectl context's namespace
 ```
+
+In the TUI stats screen, `n` toggles the same thing: LOCAL (this node) ↔
+LAB (all nodes combined, with each owner's home node).
 
 TUI keys:
 
