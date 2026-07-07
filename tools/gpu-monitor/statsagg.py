@@ -1118,16 +1118,17 @@ def render_stats_text(result, color=False, width=100, unicode_ok=True):
         nw = max([4] + [len(_owner_node_label(o, owner_nodes)) for o in owners])
     lines.append(_c("bold", "Leaderboard", color))
     if show_node:
-        header = ("%-*s %-*s %6s %6s %8s %10s %9s %8s %8s %6s"
-                  % (ow, "OWNER", nw, "NODE", "GPU-H", "EFF-H", "AVG-SM%",
+        header = ("%-3s %-*s %-*s %6s %6s %8s %10s %9s %8s %8s %6s"
+                  % ("#", ow, "OWNER", nw, "NODE", "GPU-H", "EFF-H", "AVG-SM%",
                      "AVG-UTIL%", "PEAK-MEM", "ALLOC-H", "IDLE-H", "IDLE%"))
     else:
-        header = ("%-*s %6s %6s %8s %10s %9s %8s %8s %6s"
-                  % (ow, "OWNER", "GPU-H", "EFF-H", "AVG-SM%", "AVG-UTIL%",
+        header = ("%-3s %-*s %6s %6s %8s %10s %9s %8s %8s %6s"
+                  % ("#", ow, "OWNER", "GPU-H", "EFF-H", "AVG-SM%", "AVG-UTIL%",
                      "PEAK-MEM", "ALLOC-H", "IDLE-H", "IDLE%"))
     lines.append(_c("bold", header, color))
 
-    for owner, acc in ranked:
+    for rank, (owner, acc) in enumerate(ranked, start=1):
+        rank_s = "%d." % rank
         gpu_h = acc.get("gpu_seconds", 0.0) / 3600.0
         sm = _avg(acc.get("sm_wsum", 0.0), acc.get("sm_weight", 0.0))
         util = _avg(acc.get("util_wsum", 0.0), acc.get("util_weight", 0.0))
@@ -1155,13 +1156,13 @@ def render_stats_text(result, color=False, width=100, unicode_ok=True):
 
         if show_node:
             node_s = _owner_node_label(owner, owner_nodes)
-            row = ("%-*s %-*s %6s %6s %8s %10s %9s %8s %8s %6s"
-                   % (ow, _clip(owner, ow), nw, node_s, "%.1f" % gpu_h, eff_s,
-                      sm_s, util_s, peak_s, alloc_s, idle_s, idlep_s))
+            row = ("%-3s %-*s %-*s %6s %6s %8s %10s %9s %8s %8s %6s"
+                   % (rank_s, ow, _clip(owner, ow), nw, node_s, "%.1f" % gpu_h,
+                      eff_s, sm_s, util_s, peak_s, alloc_s, idle_s, idlep_s))
         else:
-            row = ("%-*s %6s %6s %8s %10s %9s %8s %8s %6s"
-                   % (ow, _clip(owner, ow), "%.1f" % gpu_h, eff_s, sm_s, util_s,
-                      peak_s, alloc_s, idle_s, idlep_s))
+            row = ("%-3s %-*s %6s %6s %8s %10s %9s %8s %8s %6s"
+                   % (rank_s, ow, _clip(owner, ow), "%.1f" % gpu_h, eff_s, sm_s,
+                      util_s, peak_s, alloc_s, idle_s, idlep_s))
         lines.append(row)
 
     if pods_cov == 0:

@@ -20,7 +20,14 @@ import time
 import urllib.request
 from datetime import date as _date, datetime, timedelta
 
-os.environ.setdefault("TERM", "xterm-256color")
+# kubectl exec often lands us with TERM=xterm (8 colors), which drops the
+# stats grid to a monochrome ramp. Every terminal we target (WSL, Windows
+# Terminal, iTerm, ...) speaks 256 colors, and the pod ships the
+# xterm-256color terminfo, so upgrade basic variants to get the green scale.
+_term = os.environ.get("TERM", "")
+if "256" not in _term and _term in (
+        "", "xterm", "ansi", "vt100", "vt220", "linux", "screen", "tmux"):
+    os.environ["TERM"] = "xterm-256color"
 
 import render
 
@@ -532,35 +539,44 @@ class GridPainter:
     def __init__(self, curses, unicode_ok):
         self.curses = curses
         self.attrs = [0, 0, 0, 0, 0, 0]
-        self.color = False
-        can_color = False
+        self.mode = "text"          # "bg256" | "greentext" | "text"
+        self.ramp = CELL_RAMP_UNICODE if unicode_ok else CELL_RAMP_ASCII
         try:
-            can_color = curses.has_colors() and curses.COLORS >= 256
+            has = curses.has_colors()
         except Exception:
-            can_color = False
-        if can_color:
+            has = False
+        if not has:
+            return
+        try:
+            bg = -1
             try:
-                bg = -1
-                try:
-                    curses.use_default_colors()
-                except curses.error:
-                    bg = curses.COLOR_BLACK
+                curses.use_default_colors()
+            except curses.error:
+                bg = curses.COLOR_BLACK
+            if curses.COLORS >= 256:
+                # Exact GitHub-green background cells.
                 for i, col in enumerate(GRID_COLORS):
                     pair = GRID_PAIR_BASE + i
-                    # background = the green (or dark) index; fg irrelevant for
-                    # spaces but set to the same so stray glyphs stay invisible.
                     curses.init_pair(pair, col, col)
                     self.attrs[i] = curses.color_pair(pair)
-                self.color = True
-            except curses.error:
-                self.color = False
-        if not self.color:
-            self.ramp = CELL_RAMP_UNICODE if unicode_ok else CELL_RAMP_ASCII
+                self.mode = "bg256"
+            else:
+                # 8/16-color fallback: green foreground ramp (still green, and
+                # still a gradient via dim/normal/bold) instead of white blocks.
+                curses.init_pair(GRID_PAIR_BASE, curses.COLOR_GREEN, bg)
+                green = curses.color_pair(GRID_PAIR_BASE)
+                self.attrs = [0, green | curses.A_DIM, green | curses.A_DIM,
+                              green, green, green | curses.A_BOLD]
+                self.mode = "greentext"
+        except curses.error:
+            self.mode = "text"
 
     def cell(self, level):
         level = 0 if level < 0 else (5 if level > 5 else level)
-        if self.color:
+        if self.mode == "bg256":
             return ("  ", self.attrs[level])
+        if self.mode == "greentext":
+            return (self.ramp[level], self.attrs[level])
         return (self.ramp[level], 0)
 
 
@@ -631,12 +647,12 @@ def _leaderboard_rows(owners, width, owner_nodes=None):
                     key=lambda kv: -(kv[1].get("gpu_seconds", 0.0)
                                      if kv[1] else 0.0))
     node_col = " %-7s" % "NODE" if owner_nodes is not None else ""
-    header = [("%-*s%s %7s %7s %8s %9s"
-               % (ow, "OWNER", node_col, "GPU-H", "EFF-H", "AVG-SM%",
+    header = [("%-3s %-*s%s %7s %7s %8s %9s"
+               % ("#", ow, "OWNER", node_col, "GPU-H", "EFF-H", "AVG-SM%",
                   "PEAK-MEM"),
                "header")]
     rows = []
-    for owner, acc in ranked:
+    for rank, (owner, acc) in enumerate(ranked, start=1):
         acc = acc or {}
         gpu_h = acc.get("gpu_seconds", 0.0) / 3600.0
         sm_w = acc.get("sm_weight", 0.0)
@@ -655,6 +671,7 @@ def _leaderboard_rows(owners, width, owner_nodes=None):
         node_val = " %-7s" % _owner_node_label(owner, owner_nodes) \
             if owner_nodes is not None else ""
         rows.append([
+            ("%-3s " % ("%d." % rank), "dim"),
             (name, render.owner_tag(owner)),
             ("%s %7s %7s %8s %9s"
              % (node_val, "%.1f" % gpu_h, eff_s, sm_s, peak_s), "plain"),

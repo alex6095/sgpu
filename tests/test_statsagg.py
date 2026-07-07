@@ -805,8 +805,9 @@ class TestLabMerge(unittest.TestCase):
             if l == "":
                 break
             parts = l.split()
-            if parts and parts[0] in ("sujin", "minho", "shared"):
-                rows[parts[0]] = parts[1]  # NODE is the 2nd column
+            # Row layout: "<rank>. <OWNER> <NODE> <GPU-H> ..."
+            if len(parts) >= 3 and parts[1] in ("sujin", "minho", "shared"):
+                rows[parts[1]] = parts[2]  # NODE follows OWNER
         self.assertEqual(rows["sujin"], "node-02")   # single-node owner
         self.assertEqual(rows["minho"], "node-01")   # single-node owner
         self.assertEqual(rows["shared"], "both")     # split across both nodes
