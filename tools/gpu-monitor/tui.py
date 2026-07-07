@@ -808,10 +808,112 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
 
 
 def _stats_footer(stdscr, curses, attrs, width, height, statsview):
-    footer = ("t dashboard  a axis:%s  h/d/w/m  j/k scroll  r refresh  q quit"
-              % STATS_MODE_LABEL[statsview.mode])
+    footer = ("t dashboard  a axis:%s  h/d/w/m  j/k scroll  r refresh  "
+              "? help  q quit" % STATS_MODE_LABEL[statsview.mode])
     draw_segments(stdscr, curses, height - 1,
                   [(footer[:width - 1], "dim")], attrs, width)
+
+
+def help_lines():
+    """Build the help-overlay content as a list of (text, tag) lines.
+
+    Uses the same style tags the rest of the TUI renders with so the overlay
+    picks up colors from the shared attrs map. Kept curses-free (pure data) so
+    the same builder could be unit-tested.
+    """
+    lines = []
+    lines.append(("SGPU help", "title"))
+    lines.append(("", "plain"))
+
+    lines.append(("Keys", "section"))
+    lines.append(("  dashboard: j/k,arrows scroll · Tab switch pane "
+                  "(processes/pods) · s sort · o owner filter · p pause · "
+                  "r refresh · t stats screen · ? help · q quit", "plain"))
+    lines.append(("  stats screen: a or h/d/w/m axis (hour/day/week/month) · "
+                  "j/k scroll owners · r refresh · t back to dashboard · "
+                  "? help · q quit", "plain"))
+    lines.append(("", "plain"))
+
+    lines.append(("Metrics", "section"))
+    metrics = [
+        ("UTIL", "whole-GPU utilization %: share of time the GPU was doing "
+         "any work (NVML/nvidia-smi)."),
+        ("SM%", "per-process SM (streaming-multiprocessor) activity: how hard "
+         "that process drove the GPU cores."),
+        ("MEM / PEAK-MEM", "GPU memory in use / highest seen "
+         "(each H200 has ~140 GiB)."),
+        ("GPU-H", "GPU-hours: time integrated over how many GPUs an owner had "
+         "processes on."),
+        ("EFF-H", "effective GPU-hours = GPU-H x average utilization "
+         "(compute actually done)."),
+        ("ALLOC-H", "allocated GPU-hours from pods' GPU requests."),
+        ("IDLE-H / IDLE%", "allocated but no process running "
+         "(a wasted reservation)."),
+        ("REQ / ACT (pods table)", "GPUs a pod requested vs. actively "
+         "using now."),
+        ("POWER / TEMP", "power draw / cap, and temperature."),
+        ("STORAGE", "shared pv-01/pv-02 volume usage (used/total/free)."),
+    ]
+    for name, desc in metrics:
+        lines.append([("  %-22s " % name, "header"), (desc, "plain")])
+    lines.append(("", "plain"))
+
+    lines.append(("Awards", "section"))
+    lines.append(("  owner can hold at most 3; each needs its threshold met",
+                  "dim"))
+    awards = [
+        ("Best researcher", "most EFFECTIVE GPU-hours (GPU-H x avg util); "
+         "needs >=40% avg util and >=1 GPU-H."),
+        ("Power user", "most GPU-hours (>=1 GPU-H)."),
+        ("Sharpshooter", "highest average SM% (>=2 GPU-H)."),
+        ("Memory heavyweight", "highest peak GPU memory (>=32 GiB)."),
+        ("Night owl", "biggest share of own activity in KST 00-05h "
+         "(>=1 GPU-H in window)."),
+        ("Most headroom", "lowest avg util among heavy users "
+         "(>=4 GPU-H and util <40%): free speedup waiting."),
+        ("Seat warmer", "most idle allocated GPU-hours (needs the "
+         "pod-allocation view; >=2 idle GPU-H)."),
+    ]
+    for name, desc in awards:
+        lines.append([("  %s " % name, "header"), (desc, "plain")])
+    lines.append(("", "plain"))
+
+    lines.append(("↑/↓/j/k scroll · any other key closes help", "dim"))
+    return lines
+
+
+def clamp_help_offset(offset, line_count, visible_rows):
+    """Clamp a help scroll offset into [0, max(0, line_count - visible_rows)]."""
+    max_offset = max(0, line_count - max(0, visible_rows))
+    if offset < 0:
+        return 0
+    if offset > max_offset:
+        return max_offset
+    return offset
+
+
+def draw_help(stdscr, curses, attrs, width, height, offset):
+    """Render the scrollable help overlay. Returns the clamped offset used.
+
+    Draws `help_lines()` starting at row 0, skipping `offset` lines. Each line
+    may be a single (text, tag) tuple or a list of segments; both are handed to
+    draw_segments, which clips to width. Never raises on a short terminal.
+    """
+    lines = help_lines()
+    visible_rows = max(0, height)
+    offset = clamp_help_offset(offset, len(lines), visible_rows)
+    # clear() (vs erase()) forces a full repaint on the next refresh so the
+    # underlying dashboard/stats cells never bleed through the overlay.
+    stdscr.clear()
+    y = 0
+    for line in lines[offset:offset + visible_rows]:
+        if y >= height:
+            break
+        segs = line if isinstance(line, list) else [line]
+        draw_segments(stdscr, curses, y, segs, attrs, width)
+        y += 1
+    stdscr.refresh()
+    return offset
 
 
 def run_tui(stdscr, curses, fetcher, view):
@@ -831,9 +933,55 @@ def run_tui(stdscr, curses, fetcher, view):
     last_size = stdscr.getmaxyx()
     shown = None
     dirty = True
+    help_open = False
+    help_offset = 0
+    help_drawn = False
 
     while True:
         key = stdscr.getch()
+
+        # --- help overlay: renders over whichever screen is active and routes
+        # keys to itself, leaving the underlying screen state untouched so
+        # closing restores exactly where the user was. ---
+        if help_open:
+            size = stdscr.getmaxyx()
+            if size != last_size:
+                last_size = size
+                try:
+                    curses.resizeterm(*size)
+                except curses.error:
+                    pass
+                help_drawn = False
+            height, width = size
+            visible_rows = max(1, height)
+            if key != -1:
+                if key in (ord("j"), curses.KEY_DOWN):
+                    help_offset += 1
+                elif key in (ord("k"), curses.KEY_UP):
+                    help_offset -= 1
+                elif key == curses.KEY_NPAGE:
+                    help_offset += max(1, visible_rows - 1)
+                elif key == curses.KEY_PPAGE:
+                    help_offset -= max(1, visible_rows - 1)
+                elif key == ord("g"):
+                    help_offset = 0
+                elif key == ord("G"):
+                    help_offset = len(help_lines())
+                else:
+                    # any other key (incl. ?, q, Esc) closes help and returns
+                    # to the previous screen without quitting the app.
+                    help_open = False
+                    help_offset = 0
+                    dirty = True
+                    continue
+                help_drawn = False  # a scroll key moved the view
+            # The help text is static; only repaint on open/scroll/resize so
+            # the per-tick loop doesn't clear() the screen and flicker.
+            if not help_drawn:
+                help_offset = draw_help(stdscr, curses, attrs, width, height,
+                                        help_offset)
+                help_drawn = True
+            continue
 
         # --- STATS screen: independent of the live snapshot ---
         if view.screen == "stats":
@@ -857,6 +1005,11 @@ def run_tui(stdscr, curses, fetcher, view):
                     return
                 elif key in (ord("t"), 27):
                     view.screen = "dash"
+                    continue
+                elif key == ord("?"):
+                    help_open = True
+                    help_offset = 0
+                    help_drawn = False
                     continue
                 elif key == ord("a"):
                     statsview.cycle()
@@ -934,6 +1087,11 @@ def run_tui(stdscr, curses, fetcher, view):
             elif key == ord("t"):
                 view.screen = "stats"
                 stats_fetcher.request(statsview.days())
+                continue
+            elif key == ord("?"):
+                help_open = True
+                help_offset = 0
+                help_drawn = False
                 continue
             elif key in (ord("j"), curses.KEY_DOWN):
                 view.move(1, len(procs) if view.focus == "procs" else len(pods))
@@ -1050,7 +1208,7 @@ def run_tui(stdscr, curses, fetcher, view):
                                        and row_index == view.selected["pods"]
                                        and len(pods) > 0))
                 y += 1
-        footer = ("q quit  t stats  j/k scroll  Tab pane:%s  "
+        footer = ("q quit  ? help  t stats  j/k scroll  Tab pane:%s  "
                   "s sort:%s  o owner:%s  p pause  r refresh"
                   % (view.focus, view.sort, view.owner_filter or "all"))
         draw_segments(stdscr, curses, height - 1,

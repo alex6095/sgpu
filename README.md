@@ -120,6 +120,42 @@ leaderboards, awards, daily activity, and KST hour heatmaps.
 > The monitor pod must stay running for stats to accumulate. It is designed to
 > do that with tini init, `restartPolicy: Always`, and no GPU allocation.
 
+## What the numbers mean
+
+Press `?` in the TUI for this same reference in-app.
+
+| Column | Meaning |
+| --- | --- |
+| `UTIL` | Whole-GPU utilization %: share of time the GPU did **any** work (NVML/nvidia-smi). |
+| `SM%` | Per-**process** SM (streaming-multiprocessor) activity — how hard that process drove the GPU cores. |
+| `MEM` / `PEAK-MEM` | GPU memory in use / highest seen (each H200 ≈ 140 GiB). |
+| `GPU-H` | GPU-hours: time integrated over how many GPUs an owner had processes on. |
+| `EFF-H` | Effective GPU-hours = `GPU-H × avg util` (compute actually done, not just held). |
+| `ALLOC-H` | Allocated GPU-hours from pods' `nvidia.com/gpu` requests. |
+| `IDLE-H` / `IDLE%` | Allocated but no process running — a wasted reservation. |
+| `REQ` / `ACT` | (pods table) GPUs a pod requested vs. actively using right now. |
+| `POWER` / `TEMP` | Power draw / cap, and temperature. |
+| `STORAGE` | Shared `pv-01`/`pv-02` volume usage (used / total / free). |
+
+> **UTIL vs SM%**: `UTIL` is the whole card being busy at all; `SM%` is how
+> saturated the compute cores are for a specific process. High UTIL with low
+> SM% usually means the GPU is waiting on data (I/O, small batches), not
+> computing hard — that's where `EFF-H` and the "Most headroom" award come in.
+
+### Awards
+
+`sgpu stats` hands out badges (each owner holds at most 3). Criteria:
+
+| Badge | Awarded to | Threshold |
+| --- | --- | --- |
+| 🏆 Best researcher | Most **effective** GPU-hours (`GPU-H × avg util`) | ≥40% avg util, ≥1 GPU-H |
+| ⚡ Power user | Most GPU-hours | ≥1 GPU-H |
+| 🎯 Sharpshooter | Highest average `SM%` | ≥2 GPU-H |
+| 🧠 Memory heavyweight | Highest peak GPU memory | ≥32 GiB |
+| 🦉 Night owl | Biggest share of own activity in KST 00–05h | ≥1 GPU-H in window |
+| 💤 Most headroom | Lowest avg util among heavy users (free speedup waiting) | ≥4 GPU-H **and** util <40% |
+| 🪑 Seat warmer | Most idle allocated GPU-hours | ≥2 idle GPU-H (needs the pod-allocation view) |
+
 ## Deploy / Operate
 
 The monitor runs from a **public image** (`docker.io/alex6095/sgpu-monitor`),
