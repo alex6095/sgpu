@@ -118,10 +118,17 @@ def divider(width, unicode_ok=True):
     return [(ch * max(1, width), "rule")]
 
 
-def layout_header(snapshot, width):
+def layout_header(snapshot, width, live=False):
+    # live=True (the TUI) shows a real wall clock that ticks every second,
+    # decoupled from the ~2s data-refresh cadence; the "(age Ns)" the TUI
+    # appends still shows how stale the data is. The text report uses the
+    # snapshot's capture time.
     try:
-        utc = datetime.fromisoformat(
-            snapshot["time_utc"].replace("Z", "+00:00"))
+        if live:
+            utc = datetime.now(timezone.utc)
+        else:
+            utc = datetime.fromisoformat(
+                snapshot["time_utc"].replace("Z", "+00:00"))
         stamp = "%s UTC (%s KST)" % (utc.strftime("%H:%M:%S"),
                                      utc.astimezone(KST).strftime("%H:%M"))
     except (KeyError, ValueError):
@@ -179,8 +186,9 @@ def layout_gpus(snapshot, width, unicode_ok=True, spinners=None):
         else:
             active = util is not None and util >= 4
             gutter = ("* " if active else "  ", "dim")  # static, text report
-        left = "%3s %-9s " % (gpu.get("index", "?"),
-                              _short_gpu_name(gpu.get("name")))
+        # Index left-aligned so it sits under the 'G' of "GPU" (not the 'U').
+        left = "%-3s %-9s " % (gpu.get("index", "?"),
+                               _short_gpu_name(gpu.get("name")))
         util_text = "[%s] %4s  " % (
             make_bar(util, bar_w, unicode_ok),
             ("%d%%" % util) if util is not None else "?")

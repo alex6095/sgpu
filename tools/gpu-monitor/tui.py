@@ -1270,6 +1270,10 @@ def run_tui(stdscr, curses, fetcher, view):
         gpus = shown.get("gpus", [])
         active = not view.paused and any(
             (g.get("util") or 0) >= 4 for g in gpus)
+        # Tick the live header clock (and the age counter) once a second, even
+        # when idle. curses still ships only the changed cells, so it's cheap.
+        if tick and frame % SPIN_FPS == 0:
+            dirty = True
 
         if not dirty:
             # No full redraw needed. Animate the spinners cheaply: repaint only
@@ -1290,7 +1294,7 @@ def run_tui(stdscr, curses, fetcher, view):
 
         filtered = dict(shown, procs=procs)
         banner_segs = update_banner_segments(shown)
-        header_lines = render.layout_header(shown, width)
+        header_lines = render.layout_header(shown, width, live=True)
         # 2-char gutter (glyph + space) to match the header's 2-space indent.
         spinners = [(gpu_spinner_glyph(g.get("util"), frame, bars_unicode) + " ",
                      render.util_tag(g.get("util"))) for g in gpus]

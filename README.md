@@ -18,6 +18,8 @@ another Kubernetes pod.
 - Shared **storage (pv-01/pv-02) usage** at a glance.
 - Monitor pod is read-only, always-on, and requests **no GPU**.
 
+Version history: [CHANGELOG.md](CHANGELOG.md).
+
 ## Install
 
 ```bash
