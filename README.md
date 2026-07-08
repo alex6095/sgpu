@@ -120,10 +120,58 @@ up daily summaries, and stores the results on the shared volume at
 `pv-01/sangmin/sgpu`.
 
 Retention defaults to 365 days and is capped at 2 GB. `sgpu stats 30` shows
-leaderboards, awards, daily activity, and KST hour heatmaps.
+the [leaderboard, awards](#leaderboard--awards), daily activity, and KST hour
+heatmaps.
 
 > The monitor pod must stay running for stats to accumulate. It is designed to
 > do that with tini init, `restartPolicy: Always`, and no GPU allocation.
+
+## Leaderboard & awards
+
+`sgpu stats [days]` (or `sgpu --all stats` for the whole lab) ranks everyone
+by GPU-hours and hands out playful badges. Example:
+
+```text
+SGPU usage report — last 7 days — all nodes (node-01+node-02)
+data: 7 days, coverage 168.0h
+
+Awards
+🏆 Best researcher: jiwon    — 92.4 effective GPU-h (81% avg over 114.1 GPU-h)
+⚡ Power user:      jiwon    — 114.1 GPU-h
+🎯 Sharpshooter:    minseo   — 97% avg SM over 40.2 GPU-h
+🧠 Memory heavyweight: haeun — 139.7 GiB peak
+🦉 Night owl:       doyun    — 71% of activity in KST 0-5h
+💤 Most headroom:   sangho   — 22% avg util over 48 GPU-h (free speedup waiting)
+🪑 Seat warmer:     taemin   — 9.8 idle GPU-h allocated
+
+Leaderboard
+#   OWNER    NODE     GPU-H  EFF-H  AVG-SM%  AVG-UTIL%  PEAK-MEM  ALLOC-H  IDLE-H  IDLE%
+1.  jiwon    node-01  114.1   92.4       81         81      81.1    114.5     0.4      0
+2.  sangho   node-02   48.0   10.6       22         30     129.2     50.1     2.1      4
+3.  minseo   node-02   40.2   39.0       97         97      62.9     40.2     0.0      0
+4.  haeun    node-01   37.9   27.2       72         72     139.7     39.4     1.6      4
+5.  taemin   node-01   11.6    0.1        7         25     139.0     21.4     9.8     46
+```
+
+Ranking is by **GPU-H** (GPU-hours). Each owner holds **at most 3** badges.
+
+| Badge | Awarded to | Threshold |
+| --- | --- | --- |
+| 🏆 **Best researcher** | Most **effective** GPU-hours (`GPU-H × avg util`) — busiest *and* actually computing | ≥40% avg util, ≥1 GPU-H |
+| ⚡ **Power user** | Most GPU-hours overall | ≥1 GPU-H |
+| 🎯 **Sharpshooter** | Highest average `SM%` — squeezes the most out of each GPU | ≥2 GPU-H |
+| 🧠 **Memory heavyweight** | Highest peak GPU memory used | ≥32 GiB |
+| 🦉 **Night owl** | Biggest share of own activity in KST 00–05h | ≥1 GPU-H in window |
+| 💤 **Most headroom** | Lowest avg util among heavy users — a free speedup is waiting | ≥4 GPU-H **and** util <40% |
+| 🪑 **Seat warmer** | Most **idle** allocated GPU-hours (holds GPUs without using them) | ≥2 idle GPU-H (needs the pod-allocation view) |
+
+Column meanings (`GPU-H`, `EFF-H`, `SM%`, `PEAK-MEM`, `ALLOC-H`, `IDLE-H`, …)
+are in [What the numbers mean](#what-the-numbers-mean). The `NODE` column
+(lab-wide view) shows each person's home node, or `both` if they split their
+work across nodes.
+
+> Names above are illustrative. Press `?` in the TUI for the same reference
+> in-app.
 
 ## What the numbers mean
 
@@ -147,20 +195,6 @@ Press `?` in the TUI for this same reference in-app.
 > saturated the compute cores are for a specific process. High UTIL with low
 > SM% usually means the GPU is waiting on data (I/O, small batches), not
 > computing hard — that's where `EFF-H` and the "Most headroom" award come in.
-
-### Awards
-
-`sgpu stats` hands out badges (each owner holds at most 3). Criteria:
-
-| Badge | Awarded to | Threshold |
-| --- | --- | --- |
-| 🏆 Best researcher | Most **effective** GPU-hours (`GPU-H × avg util`) | ≥40% avg util, ≥1 GPU-H |
-| ⚡ Power user | Most GPU-hours | ≥1 GPU-H |
-| 🎯 Sharpshooter | Highest average `SM%` | ≥2 GPU-H |
-| 🧠 Memory heavyweight | Highest peak GPU memory | ≥32 GiB |
-| 🦉 Night owl | Biggest share of own activity in KST 00–05h | ≥1 GPU-H in window |
-| 💤 Most headroom | Lowest avg util among heavy users (free speedup waiting) | ≥4 GPU-H **and** util <40% |
-| 🪑 Seat warmer | Most idle allocated GPU-hours | ≥2 idle GPU-H (needs the pod-allocation view) |
 
 ## Deploy / Operate
 
