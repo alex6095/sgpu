@@ -733,6 +733,7 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
 
     stdscr.erase()
     y = 0
+    uok = unicode_ok()
 
     def put(segs):
         nonlocal y
@@ -741,6 +742,9 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
         draw_segments(stdscr, curses, y, segs, attrs, width)
         y += 1
         return True
+
+    def rule():
+        put(render.divider(width, uok))
 
     axis_label = STATS_MODE_LABEL[statsview.mode]
     if data is None:
@@ -772,6 +776,7 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
     if loading:
         title.append(("  (loading…)", "dim"))
     put(title)
+    rule()
 
     # --- awards (dropped first when the terminal is short) ---
     # Reserve rows for footer(1) + grid essentials so we know our budget.
@@ -785,7 +790,7 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
                     render.owner_tag(aw.get("owner"))),
                    ("  %s" % (aw.get("detail") or ""), "dim")]
             put(seg)
-        put([("", "plain")])
+        rule()
 
     # --- leaderboard (rows drop before the grid when space is tight) ---
     lb_header, lb_rows = _leaderboard_rows(owners, width, owner_nodes)
@@ -799,7 +804,7 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
         lb_budget = max(0, remaining - grid_reserve)
         for row in lb_rows[:lb_budget]:
             put(row)
-        put([("", "plain")])
+        rule()
 
     # --- the GRID ---
     tight = width < 60
@@ -1220,15 +1225,18 @@ def run_tui(stdscr, curses, fetcher, view):
         banner_segs = update_banner_segments(shown)
         header_lines = render.layout_header(shown, width)
         gpu_lines = render.layout_gpus(shown, width, bars_unicode)
+        free_lines = render.layout_free_summary(shown, width)
         storage_lines = render.layout_storage(shown, width, bars_unicode)
         proc_layout = render.layout_procs(filtered, width)
         pod_layout = render.layout_pods(dict(shown, pods=dict(
             shown.get("pods") or {}, rows=pods)), width)
+        div = render.divider(width, bars_unicode)
 
-        # Vertical budget: [banner] + header 1 + blank + gpus + blank + procs
-        # header 2 + procs rows (flex) + blank + pods (<=8) + footer.
+        # Vertical budget: [banner] + header + divider + gpus + free + storage
+        # + divider + procs header + procs rows (flex) + [divider + pods] +
+        # footer. Section dividers replace the old blank separators.
         fixed_top = (1 if banner_segs else 0) + len(header_lines) + 1 \
-            + len(gpu_lines) + len(storage_lines) + 1 \
+            + len(gpu_lines) + len(free_lines) + len(storage_lines) + 1 \
             + len(proc_layout["header"])
         pods_block = 1 + len(pod_layout["header"]) \
             + min(len(pod_layout["rows"]), 6)
@@ -1254,13 +1262,18 @@ def run_tui(stdscr, curses, fetcher, view):
                           + ([(" " + error, "crit")] if error else []),
                           attrs, width)
             y += 1
+        draw_segments(stdscr, curses, y, div, attrs, width)
         y += 1
         for line in gpu_lines:
+            draw_segments(stdscr, curses, y, line, attrs, width)
+            y += 1
+        for line in free_lines:
             draw_segments(stdscr, curses, y, line, attrs, width)
             y += 1
         for line in storage_lines:
             draw_segments(stdscr, curses, y, line, attrs, width)
             y += 1
+        draw_segments(stdscr, curses, y, div, attrs, width)
         y += 1
         for line in proc_layout["header"]:
             draw_segments(stdscr, curses, y, line, attrs, width)
@@ -1280,6 +1293,7 @@ def run_tui(stdscr, curses, fetcher, view):
                             (len(proc_rows) - start - proc_view + 1), "dim")],
                           attrs, width)
         if pods_block:
+            draw_segments(stdscr, curses, y, div, attrs, width)
             y += 1
             for line in pod_layout["header"]:
                 draw_segments(stdscr, curses, y, line, attrs, width)

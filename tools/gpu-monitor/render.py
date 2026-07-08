@@ -112,6 +112,12 @@ def _seg_line(*segments):
 # --- panes -------------------------------------------------------------------
 
 
+def divider(width, unicode_ok=True):
+    """A full-width horizontal rule separating sections."""
+    ch = "─" if unicode_ok else "-"
+    return [(ch * max(1, width), "rule")]
+
+
 def layout_header(snapshot, width):
     try:
         utc = datetime.fromisoformat(
@@ -120,26 +126,35 @@ def layout_header(snapshot, width):
                                      utc.astimezone(KST).strftime("%H:%M"))
     except (KeyError, ValueError):
         stamp = "?"
-    segments = [("SGPU  ", "title")]
-    # Headline free-GPU badge right up front — the first thing a new user
-    # wants to know is "can I launch a pod right now?".
+    # Version is always shown (Claude-Code style) so a user knows what
+    # they're on; the free-GPU badge moved to its own line under the GPUs.
+    line = "SGPU v%s  node=%s  driver=%s  %s" % (
+        snapshot.get("sgpu_version", "?"), snapshot.get("node", "?"),
+        snapshot.get("driver", "?"), stamp)
+    return [[(clip(line, width), "title")]]
+
+
+def layout_free_summary(snapshot, width):
+    """One-line "can I launch a pod?" summary, placed under the GPU table.
+
+    [N/M free]  = requestable right now (total minus pods' GPU requests).
+    +K idle     = reserved by Running pods that aren't using them.
+    """
     free = snapshot.get("gpu_free") or {}
-    if free.get("total"):
-        count = free.get("free", 0)
-        prefix = "~" if free.get("basis") == "process" else ""
-        idle = free.get("idle_reserved", 0)
-        # "[1/8 free +1 idle]": 1 requestable right now, 1 more reserved by
-        # an idle pod (physically unused, reclaimable if the holder quits).
-        segments.append(("[%s%d/%d free" % (prefix, count, free["total"]),
-                         "ok" if count > 0 else "crit"))
-        if idle > 0:
-            segments.append((" +%d idle" % idle, "warn"))
-        segments.append(("]", "ok" if count > 0 else "crit"))
-        segments.append(("  ", "plain"))
-    segments.append((clip("node=%s  driver=%s  %s" % (
-        snapshot.get("node", "?"), snapshot.get("driver", "?"), stamp),
-        max(1, width - sum(len(t) for t, _ in segments))), "title"))
-    return [segments]
+    if not free.get("total"):
+        return []
+    count = free.get("free", 0)
+    total = free["total"]
+    idle = free.get("idle_reserved", 0)
+    prefix = "~" if free.get("basis") == "process" else ""
+    in_use = max(0, total - count - idle)
+    segs = [("[%s%d/%d free" % (prefix, count, total),
+             "ok" if count > 0 else "crit")]
+    if idle > 0:
+        segs.append((" +%d idle" % idle, "warn"))
+    segs.append(("]", "ok" if count > 0 else "crit"))
+    segs.append(("  %d in use" % in_use, "dim"))
+    return [segs]
 
 
 def layout_gpus(snapshot, width, unicode_ok=True):
@@ -299,20 +314,18 @@ def render_text(snapshot, width=120, color=False, unicode_ok=True,
                 footer_notes=()):
     lines = []
     lines.extend(layout_header(snapshot, width))
-    lines.append([])
+    lines.append(divider(width, unicode_ok))
     lines.extend(layout_gpus(snapshot, width, unicode_ok))
-    lines.append([])
+    lines.extend(layout_free_summary(snapshot, width))
+    lines.extend(layout_storage(snapshot, width, unicode_ok))
+    lines.append(divider(width, unicode_ok))
     procs = layout_procs(snapshot, width)
     lines.extend(procs["header"])
     lines.extend(procs["rows"])
-    lines.append([])
+    lines.append(divider(width, unicode_ok))
     pods = layout_pods(snapshot, width)
     lines.extend(pods["header"])
     lines.extend(pods["rows"])
-    storage = layout_storage(snapshot, width, unicode_ok)
-    if storage:
-        lines.append([])
-        lines.extend(storage)
     for note in footer_notes:
         lines.append([(clip(note, width), "dim")])
     return "\n".join(paint(line, color) for line in lines) + "\n"

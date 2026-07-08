@@ -1077,6 +1077,10 @@ def render_stats_text(result, color=False, width=100, unicode_ok=True):
     owner_nodes = result.get("owner_nodes")
 
     lines = []
+    rule_char = "─" if unicode_ok else "-"
+
+    def rule():
+        lines.append(_c("dim", rule_char * max(1, width), color))
 
     # --- a. title + subtitle ---
     if result.get("scope") == "lab":
@@ -1089,7 +1093,7 @@ def render_stats_text(result, color=False, width=100, unicode_ok=True):
     day_word = "day" if len(dates) == 1 else "days"
     subtitle = "data: %d %s, coverage %.1fh" % (len(dates), day_word, coverage_h)
     lines.append(_c("dim", subtitle, color))
-    lines.append("")
+    rule()
 
     if not owners and merged.get("samples", 0) == 0:
         lines.append("no samples recorded yet")
@@ -1107,7 +1111,7 @@ def render_stats_text(result, color=False, width=100, unicode_ok=True):
         for key, _o, text in awards:
             prefix = _award_prefix(key, unicode_ok)
             lines.append("%s %s" % (prefix, text))
-        lines.append("")
+        rule()
 
     # --- c. leaderboard ---
     # When the result carries per-owner node affiliation (lab merge), add a
@@ -1169,11 +1173,12 @@ def render_stats_text(result, color=False, width=100, unicode_ok=True):
         lines.append(_c("dim",
                         "(allocation stats unavailable: no pod API coverage)",
                         color))
-    lines.append("")
+    rule()
 
     # --- d. daily activity calendar (the "grass") ---
     if len(dates) >= 2:
         _render_grass(lines, ranked, daily, dates, ow, color, unicode_ok, width)
+        rule()
 
     # --- e. KST hour heatmap ---
     # Same visual language as the grass calendar: a contiguous strip of
@@ -1209,7 +1214,7 @@ def render_stats_text(result, color=False, width=100, unicode_ok=True):
     for owner, acc in top8:
         lines.append(heat_row(owner, acc.get("hour_hist_kst", [0.0] * 24)))
     lines.append(heat_row("TOTAL", total_hist))
-    lines.append("")
+    rule()
 
     # --- f. warnings ---
     warnings = []
