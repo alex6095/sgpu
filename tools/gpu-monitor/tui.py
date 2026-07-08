@@ -41,6 +41,8 @@ JSON_URL = os.environ.get("SGPU_JSON_URL", "http://127.0.0.1:8080/json")
 STATS_URL = os.environ.get(
     "SGPU_STATS_URL", "http://127.0.0.1:8080/stats")
 DEFAULT_INTERVAL = float(os.environ.get("SGPU_TUI_INTERVAL", "2"))
+POD_NAMESPACE = os.environ.get("POD_NAMESPACE", "")
+SGPU_PEERS = os.environ.get("SGPU_PEERS", "")
 
 SORT_MODES = ("gpu", "mem", "owner")
 
@@ -59,6 +61,73 @@ GRID_PAIR_BASE = 40
 # Two-char cell ramps (index 0..5). Unicode preferred, ASCII fallback.
 CELL_RAMP_UNICODE = ("  ", "..", "░░", "▒▒", "▓▓", "██")
 CELL_RAMP_ASCII = ("  ", "..", "--", "==", "**", "##")
+
+
+def self_node_label(namespace=None):
+    ns = POD_NAMESPACE if namespace is None else namespace
+    idx = ns.find("node-")
+    return ns[idx:] if idx >= 0 else (ns or "local")
+
+
+def node_short(label):
+    text = str(label or "local")
+    if text.endswith("01"):
+        return "1"
+    if text.endswith("02"):
+        return "2"
+    if text.startswith("node-"):
+        return text[5:].lstrip("0") or text
+    return text.upper() if text == "lab" else text
+
+
+def _endpoint(base, path):
+    return base.rstrip("/") + path
+
+
+def parse_peer_urls(peers):
+    out = []
+    for part in str(peers or "").split(","):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        label, _, url = part.partition("=")
+        label = label.strip()
+        url = url.strip().rstrip("/")
+        if label and url:
+            out.append((label, url))
+    return out
+
+
+def node_targets(namespace=None, peers=None):
+    """Current node first, then other configured nodes."""
+    self_label = self_node_label(namespace)
+    targets = [(self_label, JSON_URL, STATS_URL)]
+    seen = {self_label}
+    for label, url in parse_peer_urls(SGPU_PEERS if peers is None else peers):
+        if label in seen:
+            continue
+        targets.append((label, _endpoint(url, "/json"),
+                        _endpoint(url, "/stats")))
+        seen.add(label)
+    return targets
+
+
+def footer_text(parts, width):
+    """Join footer chunks without clipping a command mid-word."""
+    parts = [p for p in parts if p]
+    limit = max(0, width - 1)
+    out = []
+    for part in parts:
+        candidate = "  ".join(out + [part])
+        if len(candidate) <= limit:
+            out.append(part)
+            continue
+        if out and len("  ".join(out + ["..."])) <= limit:
+            out.append("...")
+        break
+    if out:
+        return "  ".join(out)
+    return render.clip(parts[0] if parts else "", limit)
 
 
 # --- pure aggregation helpers (no curses) -----------------------------------
@@ -345,10 +414,12 @@ def _spaced_ticks(dates, fmt, every):
 
 
 class Fetcher(threading.Thread):
-    def __init__(self, interval):
+    def __init__(self, interval, targets=None):
         super().__init__(daemon=True)
         self.interval = interval
         self.lock = threading.Lock()
+        self.targets = targets or node_targets()
+        self.target_index = 0
         self.snapshot = None
         self.error = None
         self.fetched_at = 0.0
@@ -356,35 +427,78 @@ class Fetcher(threading.Thread):
         self.wake = threading.Event()
 
     def fetch_once(self):
+        with self.lock:
+            index = self.target_index
+            label, json_url, _stats_url = self.targets[index]
         try:
-            with urllib.request.urlopen(JSON_URL, timeout=5) as response:
+            with urllib.request.urlopen(json_url, timeout=5) as response:
                 data = json.loads(response.read().decode("utf-8"))
-            return data, None
+            return data, None, label, index
         except Exception as http_exc:
-            try:
-                import collector
-                return collector.collect(), None
-            except Exception:
-                return None, "cannot reach sgpu server: %s" % http_exc
+            if index == 0:
+                try:
+                    import collector
+                    return collector.collect(), None, label, index
+                except Exception:
+                    pass
+            return None, "cannot reach %s: %s" % (label, http_exc), label, index
 
     def run(self):
         while True:
-            snapshot, error = self.fetch_once()
+            snapshot, error, _label, index = self.fetch_once()
             with self.lock:
-                if snapshot is not None:
+                if index == self.target_index and snapshot is not None:
                     self.snapshot = snapshot
                     self.generation += 1
-                self.error = error
-                self.fetched_at = time.time()
+                    self.error = error
+                    self.fetched_at = time.time()
+                elif index == self.target_index:
+                    self.error = error
+                    self.fetched_at = time.time()
             self.wake.wait(self.interval)
             self.wake.clear()
 
     def poke(self):
         self.wake.set()
 
+    def target_label(self):
+        with self.lock:
+            return self.targets[self.target_index][0]
+
+    def target_short(self):
+        return node_short(self.target_label())
+
+    def node_labels(self, current_first=False):
+        with self.lock:
+            labels = [t[0] for t in self.targets]
+            index = self.target_index
+        if current_first and labels:
+            labels = labels[index:] + labels[:index]
+        return labels
+
+    def stats_urls(self):
+        with self.lock:
+            return {label: stats_url for label, _json_url, stats_url
+                    in self.targets}
+
+    def cycle_target(self):
+        with self.lock:
+            if len(self.targets) <= 1:
+                return self.targets[self.target_index][0]
+            self.target_index = (self.target_index + 1) % len(self.targets)
+            self.snapshot = None
+            self.error = None
+            self.fetched_at = 0.0
+            self.generation += 1
+            label = self.targets[self.target_index][0]
+        self.wake.set()
+        return label
+
     def state(self):
         with self.lock:
-            return self.snapshot, self.error, self.fetched_at, self.generation
+            label = self.targets[self.target_index][0]
+            return self.snapshot, self.error, self.fetched_at, \
+                self.generation, label
 
 
 class View:
@@ -495,16 +609,18 @@ class StatsFetcher(threading.Thread):
     Reuses the daemon-thread + Event pattern so the UI loop never blocks.
     """
 
-    def __init__(self):
+    def __init__(self, stats_urls=None):
         super().__init__(daemon=True)
         self.lock = threading.Lock()
+        self.stats_urls = stats_urls or {self_node_label(): STATS_URL}
         self.cache = {}          # (days, scope) -> {"data","error","fetched_at"}
         self.pending = set()     # (days, scope) keys awaiting a fetch
         self.inflight = set()    # (days, scope) currently being fetched
         self.wake = threading.Event()
 
     def fetch_once(self, days, scope):
-        url = "%s?days=%d&format=json" % (STATS_URL, int(days))
+        base = self.stats_urls.get(scope, STATS_URL)
+        url = "%s?days=%d&format=json" % (base, int(days))
         if scope == "lab":
             url += "&scope=lab"
         try:
@@ -569,17 +685,42 @@ class StatsFetcher(threading.Thread):
 class StatsView:
     """Scroll/axis state for the interactive STATS screen."""
 
-    def __init__(self):
+    def __init__(self, node_labels=None):
         self.mode = "hours"      # one of STATS_MODES
         self.offset = 0          # owner-row scroll within the grid
-        self.scope = "local"     # "local" (this node) or "lab" (all nodes)
+        self.node_labels = list(node_labels or [self_node_label()])
+        self.scopes = self.node_labels + ["lab"]
+        self.scope = self.scopes[0]
 
     def days(self):
         return STATS_MODE_DAYS[self.mode]
 
     def toggle_scope(self):
-        self.scope = "lab" if self.scope == "local" else "local"
+        if self.scope not in self.scopes:
+            self.scope = self.scopes[0]
+        else:
+            self.scope = self.scopes[
+                (self.scopes.index(self.scope) + 1) % len(self.scopes)]
         self.offset = 0
+
+    def set_node_order(self, labels):
+        labels = list(labels or self.node_labels)
+        if not labels:
+            labels = [self_node_label()]
+        self.node_labels = labels
+        self.scopes = labels + ["lab"]
+        if self.scope not in self.scopes:
+            self.scope = self.scopes[0]
+        self.offset = 0
+
+    def prefer_node(self, label):
+        self.set_node_order([label] + [n for n in self.node_labels
+                                       if n != label])
+        self.scope = label
+        self.offset = 0
+
+    def scope_label(self):
+        return node_short(self.scope)
 
     def cycle(self):
         self.mode = STATS_MODES[
@@ -849,7 +990,8 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
     axis_label = STATS_MODE_LABEL[statsview.mode]
     if data is None:
         put([("SGPU stats", "title"),
-             ("  axis: %s" % axis_label, "dim")])
+             ("  axis: %s" % axis_label, "dim"),
+             ("  scope: %s" % statsview.scope_label(), "dim")])
         if loading:
             put([("%s loading…" % spin, "warn")])
         elif error:
@@ -869,8 +1011,9 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
         else None
 
     age = time.time() - fetched_at if fetched_at else 0.0
-    scope_label = " — all nodes" if statsview.scope == "lab" else ""
-    title = [("SGPU stats — last %d days — axis: %s%s"
+    scope_label = "LAB" if statsview.scope == "lab" \
+        else "node-%s" % statsview.scope_label()
+    title = [("SGPU stats — last %d days — axis: %s — scope: %s"
               % (window_days, axis_label, scope_label), "title"),
              ("  (age %ds)" % int(age), "dim")]
     if loading:
@@ -964,7 +1107,7 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
 
     if start + rows_avail < total_owner_rows and y < height - 1:
         draw_segments(stdscr, curses, y,
-                      [("… %d more owners (j/k)"
+                      [("… %d more owners (↑↓)"
                         % (total_owner_rows - start - rows_avail), "dim")],
                       attrs, width)
         y += 1
@@ -989,12 +1132,19 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
 
 
 def _stats_footer(stdscr, curses, attrs, width, height, statsview):
-    footer = ("t dashboard  a axis:%s  h/d/w/m  n scope:%s  ↑↓ scroll  "
-              "r refresh  ? help  q quit"
-              % (STATS_MODE_LABEL[statsview.mode],
-                 "LAB" if statsview.scope == "lab" else "LOCAL"))
+    footer = footer_text([
+        "t dashboard",
+        "a axis:%s" % STATS_MODE_LABEL[statsview.mode],
+        "h/d/w/m",
+        "n scope:%s" % statsview.scope_label(),
+        "↑↓ scroll",
+        "PgUp/PgDn",
+        "r refresh",
+        "? help",
+        "q quit",
+    ], width)
     draw_segments(stdscr, curses, height - 1,
-                  [(footer[:width - 1], "dim")], attrs, width)
+                  [(footer, "dim")], attrs, width)
 
 
 def help_lines():
@@ -1010,13 +1160,15 @@ def help_lines():
 
     lines.append(("Keys", "section"))
     lines.append(("  detail: Enter opens the selected process/pod; "
-                  "Enter or Esc returns; j/k scrolls; r refreshes", "plain"))
+                  "Enter or Esc returns; arrows/wheel scroll; r refreshes",
+                  "plain"))
     lines.append(("  dashboard: j/k,arrows scroll · Tab switch pane "
                   "(processes/pods) · s sort · o owner filter · p pause · "
-                  "r refresh · t stats screen · ? help · q quit", "plain"))
+                  "n switch node · r refresh · t stats screen · ? help · "
+                  "q quit", "plain"))
     lines.append(("  stats screen: a or h/d/w/m axis (hour/day/week/month) · "
-                  "n scope local/lab (all nodes) · "
-                  "j/k scroll owners · r refresh · t back to dashboard · "
+                  "n scope current/other/LAB · "
+                  "arrows scroll owners · r refresh · t back to dashboard · "
                   "? help · q quit", "plain"))
     lines.append(("", "plain"))
 
@@ -1262,15 +1414,20 @@ def _append_related_procs(lines, procs, width, now):
     cmd_w = max(8, width - fixed)
     for proc in procs:
         sm = proc.get("sm_util")
-        row = "%3s  %7s  %4s  %7s  %7s  %s" % (
+        prefix = "%3s  %7s  %4s  %7s  %7s  " % (
             proc.get("gpu_index") if proc.get("gpu_index") is not None else "?",
             proc.get("pid", "?"),
             ("%d" % sm) if sm is not None else "-",
             render.fmt_gib(proc.get("mem_mib")),
-            render.fmt_uptime(proc.get("started_utc"), now),
-            render.clip(proc.get("cmd") or "?", cmd_w))
-        lines.append([(render.clip(row, width),
-                       render.util_tag(sm) if sm is not None else "plain")])
+            render.fmt_uptime(proc.get("started_utc"), now))
+        chunks = textwrap.wrap(proc.get("cmd") or "?", cmd_w,
+                               break_long_words=True,
+                               replace_whitespace=False) or ["?"]
+        tag = render.util_tag(sm) if sm is not None else "plain"
+        lines.append([(render.clip(prefix + chunks[0], width), tag)])
+        indent = " " * len(prefix)
+        for chunk in chunks[1:]:
+            lines.append([(render.clip(indent + chunk, width), "dim")])
 
 
 def detail_lines(snapshot, detail, width, now=None, unicode=True):
@@ -1386,10 +1543,18 @@ def draw_detail(stdscr, curses, attrs, width, height, snapshot, detail, offset,
     more = ""
     if offset + visible_rows < len(lines):
         more = "  +%d more" % (len(lines) - offset - visible_rows)
-    footer = ("Enter/Esc dashboard  j/k scroll  r refresh  p pause:%s  "
-              "? help  q quit%s" % (mode, more))
+    footer = footer_text([
+        "Enter/Esc dashboard",
+        "↑↓ scroll",
+        "PgUp/PgDn",
+        "r refresh",
+        "p pause:%s" % mode,
+        "? help",
+        "q quit",
+        more.strip(),
+    ], width)
     draw_segments(stdscr, curses, height - 1,
-                  [(footer[:width - 1], "dim")], attrs, width)
+                  [(footer, "dim")], attrs, width)
     stdscr.refresh()
     return offset
 
@@ -1404,9 +1569,9 @@ def run_tui(stdscr, curses, fetcher, view):
     attrs = build_tag_attrs(curses)
     bars_unicode = unicode_ok()
     painter = GridPainter(curses, bars_unicode)
-    stats_fetcher = StatsFetcher()
+    stats_fetcher = StatsFetcher(fetcher.stats_urls())
     stats_fetcher.start()
-    statsview = StatsView()
+    statsview = StatsView(fetcher.node_labels(current_first=True))
     last_generation = -1
     last_size = stdscr.getmaxyx()
     shown = None
@@ -1543,7 +1708,7 @@ def run_tui(stdscr, curses, fetcher, view):
                            attrs, width, height, frame)
             continue
 
-        snapshot, error, fetched_at, generation = fetcher.state()
+        snapshot, error, fetched_at, generation, target_label = fetcher.state()
         if snapshot is None:
             stdscr.erase()
             draw_segments(stdscr, curses, 0,
@@ -1582,6 +1747,7 @@ def run_tui(stdscr, curses, fetcher, view):
                     view.close_detail()
                     continue
                 elif key == ord("t"):
+                    statsview.prefer_node(fetcher.target_label())
                     view.screen = "stats"
                     stats_fetcher.request(statsview.days(), statsview.scope)
                     continue
@@ -1630,8 +1796,17 @@ def run_tui(stdscr, curses, fetcher, view):
             if key in (ord("q"), 3, 27):
                 return
             elif key == ord("t"):
+                statsview.prefer_node(fetcher.target_label())
                 view.screen = "stats"
                 stats_fetcher.request(statsview.days(), statsview.scope)
+                continue
+            elif key == ord("n"):
+                view.paused = False
+                shown = None
+                last_generation = -1
+                target_label = fetcher.cycle_target()
+                statsview.set_node_order(fetcher.node_labels(current_first=True))
+                dirty = True
                 continue
             elif is_enter_key(curses, key):
                 if view.open_detail(procs, pods):
@@ -1800,11 +1975,21 @@ def run_tui(stdscr, curses, fetcher, view):
                                 (len(pod_rows) - pod_start - pods_view + 1,
                                  hint), "dim")],
                               attrs, width)
-        footer = ("q quit  ? help  Enter detail  t stats  ↑↓ scroll  Tab pane:%s  "
-                  "s sort:%s  o owner:%s  p pause  r refresh"
-                  % (view.focus, view.sort, view.owner_filter or "all"))
+        footer = footer_text([
+            "q quit",
+            "? help",
+            "Enter detail",
+            "t stats",
+            "n node:%s" % node_short(target_label),
+            "↑↓ scroll",
+            "Tab:%s" % view.focus,
+            "s:%s" % view.sort,
+            "o:%s" % (view.owner_filter or "all"),
+            "p pause",
+            "r refresh",
+        ], width)
         draw_segments(stdscr, curses, height - 1,
-                      [(footer[:width - 1], "dim")], attrs, width)
+                      [(footer, "dim")], attrs, width)
         stdscr.refresh()
 
 
@@ -1821,11 +2006,11 @@ def main():
     except locale.Error:
         pass
 
-    fetcher = Fetcher(interval)
+    fetcher = Fetcher(interval, node_targets())
     fetcher.start()
 
     if not sys.stdout.isatty():
-        snapshot, error = fetcher.fetch_once()
+        snapshot, error, _label, _index = fetcher.fetch_once()
         if snapshot is None:
             print(error, file=sys.stderr)
             return 1
@@ -1840,7 +2025,7 @@ def main():
         pass
     except Exception as exc:
         # curses failed (weird TERM etc.) — degrade to one-shot text.
-        snapshot, error = fetcher.fetch_once()
+        snapshot, error, _label, _index = fetcher.fetch_once()
         if snapshot is not None:
             print(render.render_text(snapshot, color=False), end="")
             print("(tui unavailable: %s)" % exc, file=sys.stderr)

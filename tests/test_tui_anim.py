@@ -11,6 +11,30 @@ import tui       # noqa: E402
 import render    # noqa: E402
 
 
+class TestNodeTargetsAndFooters(unittest.TestCase):
+    def test_node_targets_put_current_namespace_first(self):
+        targets = tui.node_targets(
+            namespace="p-sgvr-node-02",
+            peers="node-01=http://n1:8080,node-02=http://n2:8080")
+        self.assertEqual([row[0] for row in targets], ["node-02", "node-01"])
+        self.assertEqual(targets[1][1], "http://n1:8080/json")
+        self.assertEqual(targets[1][2], "http://n1:8080/stats")
+
+    def test_stats_scope_cycles_current_other_lab(self):
+        view = tui.StatsView(["node-02", "node-01"])
+        self.assertEqual(view.scope_label(), "2")
+        view.toggle_scope()
+        self.assertEqual(view.scope_label(), "1")
+        view.toggle_scope()
+        self.assertEqual(view.scope_label(), "LAB")
+
+    def test_footer_drops_whole_chunks_instead_of_clipping_words(self):
+        text = tui.footer_text(
+            ["q quit", "? help", "Enter detail", "r refresh"], width=34)
+        self.assertLessEqual(len(text), 33)
+        self.assertNotIn("refres", text)
+
+
 class TestGpuSpinner(unittest.TestCase):
     def test_idle_is_static_dot(self):
         for util in (None, 0, 3):
@@ -116,6 +140,16 @@ class TestDetailLines(unittest.TestCase):
         self.assertIn("Active GPUs", text)
         self.assertIn("GPU 3", text)
         self.assertIn("2621452", text)
+
+    def test_related_process_command_wraps_instead_of_disappearing(self):
+        snap = self._snap()
+        snap["procs"][0]["cmd"] = (
+            "python train_lpwm.py --config configs/very-long-config.yaml "
+            "--output-dir /output/long/path --run-name wrapped-command")
+        ref = {"kind": "pod", "pod": "ty-lpwm-panda2t", "uid": "pod-uid"}
+        text = self._plain(tui.detail_lines(snap, ref, 68))
+        self.assertIn("--output-dir", text)
+        self.assertIn("wrapped-command", text)
 
     def test_stale_process_uses_last_known_values(self):
         ref = {"kind": "proc", "pid": 7,

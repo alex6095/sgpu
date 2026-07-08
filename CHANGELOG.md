@@ -6,6 +6,22 @@ number so a client never falsely reports itself "behind the server".
 
 ---
 
+## 0.8.13 — Node switching and detail polish
+
+- The interactive dashboard can now switch nodes in-place with `n`, so you can
+  jump between node 1 and node 2 without quitting and relaunching `sgpu -n 1`
+  or `sgpu -n 2`.
+- The stats screen scope now follows the node model: opening from node 2 cycles
+  `scope:2 -> scope:1 -> scope:LAB` (and vice versa from node 1), instead of
+  the less-specific `LOCAL` / `LAB` toggle.
+- Footer hints now shrink by whole command chunks, so narrow terminals do not
+  cut words like `refresh` in half.
+- Detail screens prefer arrow/wheel scroll hints and wrap long related-process
+  commands instead of clipping the command just when you opened detail to read
+  it.
+
+---
+
 ## 0.8.12 — Pod table fills the screen
 
 - The pods pane now **expands with the terminal height** like the process
