@@ -21,10 +21,15 @@ another Kubernetes pod.
 ## Install
 
 ```bash
-uvx sgpu            # run without installing (uv)
-pipx install sgpu   # or pipx
-pip install sgpu    # or plain pip (WSL/Ubuntu: add --user --break-system-packages)
+uv tool install sgpu   # persistent install via uv (recommended)
+pipx install sgpu      # or pipx
+pip install sgpu       # or plain pip (needs pip; WSL/Ubuntu often lacks it)
+uvx sgpu               # or run once without installing
 ```
+
+Upgrade with the tool you installed with — `uv tool upgrade sgpu`,
+`pipx upgrade sgpu`, or `pip install -U sgpu`. sgpu tells you the right one
+when it detects your client is behind the server.
 
 Needs `kubectl` with an MLXP kubeconfig ([setup](#kubectl-setup-linuxwsl)).
 One kubeconfig covers **both** H200 servers - the two downloads

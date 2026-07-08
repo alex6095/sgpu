@@ -147,6 +147,17 @@ UPDATE_CHECK_TTL = 6 * 3600
 _CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "sgpu")
 
 
+def _upgrade_command():
+    """The upgrade command that matches how this client was installed, so the
+    nudge never tells a uv/pipx user to run a pip command they don't have."""
+    hay = (sys.prefix + " " + (sys.argv[0] or "")).replace("\\", "/").lower()
+    if "uv/tools" in hay or "/uv/" in hay:
+        return "uv tool upgrade sgpu"
+    if "pipx" in hay:
+        return "pipx upgrade sgpu"
+    return "pip install -U sgpu"
+
+
 def _version_tuple(text):
     parts = []
     for chunk in str(text).split("."):
@@ -213,8 +224,8 @@ def _emit_update_notice(namespace, pod, no_color):
     server = _server_version(namespace, pod)
     if not _is_outdated(__version__, server):
         return
-    msg = ("sgpu %s is available (you have %s) — upgrade: pip install -U sgpu"
-           % (server, __version__))
+    msg = ("sgpu %s is available (you have %s) — upgrade: %s"
+           % (server, __version__, _upgrade_command()))
     if no_color:
         print("\n^ " + msg, file=sys.stderr)
     else:
@@ -360,6 +371,7 @@ def main(argv=None):
         # upgrade banner when this client is behind the server.
         pod_command = (["nvitop"] if args.command == "nvitop"
                        else ["env", "SGPU_CLIENT_VERSION=" + __version__,
+                             "SGPU_UPGRADE_CMD=" + _upgrade_command(),
                              "python3", "/opt/gpu-monitor/tui.py",
                              str(args.refresh)])
         return _interactive(namespace, args.pod, pod_command, args.no_color)

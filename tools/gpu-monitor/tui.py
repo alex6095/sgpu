@@ -201,10 +201,11 @@ def update_banner_segments(snapshot):
             return None
     except Exception:
         return None
+    cmd = os.environ.get("SGPU_UPGRADE_CMD") or "pip install -U sgpu"
     return [("↑ update available: ", "warn"),
             ("sgpu %s" % server, "header"),
             (" (you have %s) — run: " % client, "dim"),
-            ("pip install -U sgpu", "warn")]
+            (cmd, "warn")]
 
 
 def owner_series_from_columns(columns, owner):
