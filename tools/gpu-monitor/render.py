@@ -120,9 +120,21 @@ def layout_header(snapshot, width):
                                      utc.astimezone(KST).strftime("%H:%M"))
     except (KeyError, ValueError):
         stamp = "?"
-    line = "SGPU  node=%s  driver=%s  %s" % (
-        snapshot.get("node", "?"), snapshot.get("driver", "?"), stamp)
-    return [[(clip(line, width), "title")]]
+    segments = [("SGPU  ", "title")]
+    # Headline free-GPU badge right up front — the first thing a new user
+    # wants to know is "can I launch a pod right now?".
+    free = snapshot.get("gpu_free") or {}
+    if free.get("total"):
+        count = free.get("free", 0)
+        badge = "[%d/%d free]" % (count, free["total"])
+        if free.get("basis") == "process":
+            badge = "[~%d/%d free]" % (count, free["total"])  # estimate
+        segments.append((badge, "ok" if count > 0 else "crit"))
+        segments.append(("  ", "plain"))
+    segments.append((clip("node=%s  driver=%s  %s" % (
+        snapshot.get("node", "?"), snapshot.get("driver", "?"), stamp),
+        max(1, width - sum(len(t) for t, _ in segments))), "title"))
+    return [segments]
 
 
 def layout_gpus(snapshot, width, unicode_ok=True):

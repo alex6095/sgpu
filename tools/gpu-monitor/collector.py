@@ -23,7 +23,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
-SGPU_VERSION = "0.8.1"
+SGPU_VERSION = "0.8.2"
 SCHEMA = 2
 
 MOCK = os.environ.get("SGPU_MOCK", "") == "1"
@@ -551,6 +551,21 @@ def collect(include_pods=True, force=False):
 
         procs.sort(key=lambda p: (p["gpu_index"] if p["gpu_index"] is not None
                                   else 999, -(p["mem_mib"] or 0)))
+
+        # Headline "N/M free": how many GPUs a new pod could still request.
+        # Allocation-based when the pod API is available (a GPU reserved by an
+        # idle pod is NOT launchable); process-based fallback otherwise.
+        total_gpus = len(gpus)
+        if pods.get("ok"):
+            allocated = sum(int(row.get("gpu") or 0)
+                            for row in pods.get("rows", []))
+            gpu_free = {"free": max(0, total_gpus - allocated),
+                        "total": total_gpus, "basis": "allocation"}
+        else:
+            idle = sum(1 for g in gpus if not g.get("owners")
+                       and (g.get("mem_used_mib") or 0) < 1024)
+            gpu_free = {"free": idle, "total": total_gpus, "basis": "process"}
+
         snapshot = {
             "schema": SCHEMA,
             "source": base["source"],
@@ -562,6 +577,7 @@ def collect(include_pods=True, force=False):
             "procs": procs,
             "pods": pods,
             "storage": _storage_info(),
+            "gpu_free": gpu_free,
         }
         if base.get("error"):
             snapshot["error"] = base["error"]
