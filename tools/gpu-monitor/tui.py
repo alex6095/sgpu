@@ -1147,30 +1147,60 @@ def _stats_footer(stdscr, curses, attrs, width, height, statsview):
                   [(footer, "dim")], attrs, width)
 
 
-def help_lines():
+def _help_divider(width):
+    return render.divider(max(1, width))
+
+
+def _help_item(lines, label, desc, width, desc_tag="plain"):
+    prefix = "  %-12s " % label
+    body_width = max(1, width - len(prefix))
+    chunks = textwrap.wrap(str(desc), body_width, break_long_words=True,
+                           replace_whitespace=False) or [""]
+    lines.append([(prefix, "ok"), (chunks[0], desc_tag)])
+    indent = " " * len(prefix)
+    for chunk in chunks[1:]:
+        lines.append([(indent, "plain"), (chunk, desc_tag)])
+
+
+def _help_pair(lines, name, desc, width, name_width=22):
+    prefix = "  %-*s " % (name_width, name)
+    body_width = max(1, width - len(prefix))
+    chunks = textwrap.wrap(str(desc), body_width, break_long_words=True,
+                           replace_whitespace=False) or [""]
+    lines.append([(prefix, "header"), (chunks[0], "dim")])
+    indent = " " * len(prefix)
+    for chunk in chunks[1:]:
+        lines.append([(indent, "plain"), (chunk, "dim")])
+
+
+def help_lines(width=120):
     """Build the help-overlay content as a list of (text, tag) lines.
 
     Uses the same style tags the rest of the TUI renders with so the overlay
     picks up colors from the shared attrs map. Kept curses-free (pure data) so
     the same builder could be unit-tested.
     """
+    width = max(20, int(width or 120))
     lines = []
     lines.append(("SGPU help", "title"))
-    lines.append(("", "plain"))
+    lines.append(_help_divider(width))
 
     lines.append(("Keys", "section"))
-    lines.append(("  detail: Enter opens the selected process/pod; "
-                  "Enter or Esc returns; arrows/wheel scroll; r refreshes",
-                  "plain"))
-    lines.append(("  dashboard: j/k,arrows scroll · Tab switch pane "
-                  "(processes/pods) · s sort · o owner filter · p pause · "
-                  "n switch node · r refresh · t stats screen · ? help · "
-                  "q quit", "plain"))
-    lines.append(("  stats screen: a or h/d/w/m axis (hour/day/week/month) · "
-                  "n scope current/other/LAB · "
-                  "arrows scroll owners · r refresh · t back to dashboard · "
-                  "? help · q quit", "plain"))
-    lines.append(("", "plain"))
+    _help_item(lines, "Dashboard",
+               "Enter detail · Tab pane · ↑/↓/wheel scroll · "
+               "n node 1/2 · s sort · o owner · p pause · t stats · "
+               "r refresh · ? help · q quit",
+               width)
+    _help_item(lines, "Detail",
+               "Enter/Esc dashboard · ↑/↓/wheel scroll · PgUp/PgDn page · "
+               "r refresh · p pause · t stats · ? help · q quit",
+               width)
+    _help_item(lines, "Stats",
+               "n scope 1/2/LAB · a cycle axis · h/d/w/m axis · "
+               "↑/↓ scroll owners · PgUp/PgDn page · r refresh · "
+               "t dashboard · ? help · q quit",
+               width)
+    lines.append(_help_divider(width))
 
     lines.append(("Metrics", "section"))
     metrics = [
@@ -1193,12 +1223,14 @@ def help_lines():
         ("STORAGE", "shared pv-01/pv-02 volume usage (used/total/free)."),
     ]
     for name, desc in metrics:
-        lines.append([("  %-22s " % name, "header"), (desc, "plain")])
-    lines.append(("", "plain"))
+        _help_pair(lines, name, desc, width)
+    lines.append(_help_divider(width))
 
     lines.append(("Awards", "section"))
-    lines.append(("  owner can hold at most 3; each needs its threshold met",
-                  "dim"))
+    _help_item(lines, "Rule",
+               "one owner can hold at most 3 awards; each award also needs "
+               "its threshold met",
+               width, desc_tag="dim")
     awards = [
         ("Best researcher", "most EFFECTIVE GPU-hours (GPU-H x avg util); "
          "needs >=40% avg util and >=1 GPU-H."),
@@ -1213,10 +1245,11 @@ def help_lines():
          "pod-allocation view; >=2 idle GPU-H)."),
     ]
     for name, desc in awards:
-        lines.append([("  %s " % name, "header"), (desc, "plain")])
-    lines.append(("", "plain"))
+        _help_pair(lines, name, desc, width, name_width=20)
+    lines.append(_help_divider(width))
 
-    lines.append(("↑/↓/j/k scroll · any other key closes help", "dim"))
+    lines.append(("↑/↓/j/k scroll · PgUp/PgDn page · any other key closes help",
+                  "dim"))
     return lines
 
 
@@ -1237,7 +1270,7 @@ def draw_help(stdscr, curses, attrs, width, height, offset):
     may be a single (text, tag) tuple or a list of segments; both are handed to
     draw_segments, which clips to width. Never raises on a short terminal.
     """
-    lines = help_lines()
+    lines = help_lines(width)
     visible_rows = max(0, height)
     offset = clamp_help_offset(offset, len(lines), visible_rows)
     # clear() (vs erase()) forces a full repaint on the next refresh so the
@@ -1427,7 +1460,7 @@ def _append_related_procs(lines, procs, width, now):
         lines.append([(render.clip(prefix + chunks[0], width), tag)])
         indent = " " * len(prefix)
         for chunk in chunks[1:]:
-            lines.append([(render.clip(indent + chunk, width), "dim")])
+            lines.append([(render.clip(indent + chunk, width), tag)])
 
 
 def detail_lines(snapshot, detail, width, now=None, unicode=True):
@@ -1617,7 +1650,7 @@ def run_tui(stdscr, curses, fetcher, view):
                 elif key == ord("g"):
                     help_offset = 0
                 elif key == ord("G"):
-                    help_offset = len(help_lines())
+                    help_offset = len(help_lines(width))
                 else:
                     # any other key (incl. ?, q, Esc) closes help and returns
                     # to the previous screen without quitting the app.
@@ -1647,7 +1680,8 @@ def run_tui(stdscr, curses, fetcher, view):
             height, width = size
             # lazily fetch the current mode's window on entry / mode switch
             stats_fetcher.request(statsview.days(), statsview.scope)
-            data, _serr, _sat = stats_fetcher.get(statsview.days())
+            data, _serr, _sat = stats_fetcher.get(
+                statsview.days(), statsview.scope)
             owners = ((data or {}).get("merged") or {}).get("owners") or {}
             n_owners = len(owners)
             if key != -1:

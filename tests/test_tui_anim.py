@@ -34,6 +34,22 @@ class TestNodeTargetsAndFooters(unittest.TestCase):
         self.assertLessEqual(len(text), 33)
         self.assertNotIn("refres", text)
 
+    def test_help_wraps_and_matches_node_scope_labels(self):
+        lines = tui.help_lines(72)
+        text = "\n".join("".join(seg for seg, _tag in (
+            line if isinstance(line, list) else [line]))
+                         for line in lines)
+        self.assertIn("n scope 1/2/LAB", text)
+        self.assertNotIn("current/other/LAB", text)
+        self.assertGreaterEqual(
+            sum(1 for line in lines
+                if isinstance(line, list) and line and line[0][1] == "rule"),
+            3)
+        for line in lines:
+            plain = "".join(seg for seg, _tag in (
+                line if isinstance(line, list) else [line]))
+            self.assertLessEqual(len(plain), 72)
+
 
 class TestGpuSpinner(unittest.TestCase):
     def test_idle_is_static_dot(self):
@@ -150,6 +166,21 @@ class TestDetailLines(unittest.TestCase):
         text = self._plain(tui.detail_lines(snap, ref, 68))
         self.assertIn("--output-dir", text)
         self.assertIn("wrapped-command", text)
+
+    def test_related_process_wrapped_command_keeps_same_color(self):
+        snap = self._snap()
+        snap["procs"][0]["cmd"] = (
+            "python train_lpwm.py --config configs/very-long-config.yaml "
+            "--output-dir /output/long/path --run-name wrapped-command")
+        ref = {"kind": "pod", "pod": "ty-lpwm-panda2t", "uid": "pod-uid"}
+        lines = tui.detail_lines(snap, ref, 68)
+        wrapped_tags = []
+        for line in lines:
+            for text, tag in line:
+                if "--output-dir" in text or "wrapped-command" in text:
+                    wrapped_tags.append(tag)
+        self.assertTrue(wrapped_tags)
+        self.assertEqual(set(wrapped_tags), {"crit"})
 
     def test_stale_process_uses_last_known_values(self):
         ref = {"kind": "proc", "pid": 7,

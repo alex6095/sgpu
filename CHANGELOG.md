@@ -6,6 +6,18 @@ number so a client never falsely reports itself "behind the server".
 
 ---
 
+## 0.8.14 — Help clarity and wrapped command color
+
+- Help now wraps every long explanation to the terminal width instead of
+  clipping the right side, and its key hints match the current node/scope
+  model (`n node 1/2`, `n scope 1/2/LAB`).
+- Help sections now have visual dividers and colored labels so keys, metrics,
+  and awards are easier to scan in a wide terminal.
+- Detail views keep wrapped related-process command lines in the same color as
+  the first line, instead of turning continuation lines dim gray.
+
+---
+
 ## 0.8.13 — Node switching and detail polish
 
 - The interactive dashboard can now switch nodes in-place with `n`, so you can

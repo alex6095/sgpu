@@ -23,7 +23,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
-SGPU_VERSION = "0.8.13"
+SGPU_VERSION = "0.8.14"
 SCHEMA = 2
 
 MOCK = os.environ.get("SGPU_MOCK", "") == "1"
