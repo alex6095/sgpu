@@ -74,8 +74,12 @@ spec:
           value: /etc/sgpu/kubeconfig/config
         - name: SGPU_DATA_DIR
           value: /var/lib/sgpu
+        # 60s: GPU jobs run for hours, so sub-minute sampling was redundant.
+        # 1440 samples/day still gives robust util/idle/heatmap stats at
+        # ~0.1 MB/day/node gzipped. Per-day interval inference means old 15s
+        # data and new 60s data still aggregate correctly together.
         - name: SGPU_SAMPLE_INTERVAL
-          value: "15"
+          value: "60"
         # Lab-wide stats (/stats?scope=lab): every node's monitor, same value
         # everywhere — the server skips the entry matching its own namespace.
         - name: SGPU_PEERS

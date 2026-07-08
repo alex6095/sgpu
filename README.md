@@ -130,9 +130,11 @@ Text endpoints support `?color=1&cols=N&ascii=1`.
 
 ## Stats
 
-SGPU samples every 15 seconds around the clock into raw JSONL, gzips and rolls
+SGPU samples every 60 seconds around the clock into raw JSONL, gzips and rolls
 up daily summaries, and stores the results on the shared volume at
-`pv-01/sangmin/sgpu`.
+`pv-01/sangmin/sgpu` (~0.1 MB/day/node gzipped). The interval is set by
+`SGPU_SAMPLE_INTERVAL`; the aggregator infers each day's interval, so
+changing it never breaks historical stats.
 
 Retention defaults to 365 days and is capped at 2 GB. `sgpu stats 30` shows
 the [leaderboard, awards](#leaderboard--awards), daily activity, and KST hour
