@@ -286,6 +286,25 @@ def stats_loading_glyph(frame, unicode_ok=True):
     return frames[(frame // 3) % len(frames)]
 
 
+def frame_sleep_seconds(now, last_frame):
+    """How long a nonblocking input loop should sleep before the next frame."""
+    remaining = _FRAME_INTERVAL - max(0.0, now - last_frame)
+    if remaining <= 0:
+        return 0.0
+    return min(_FRAME_INTERVAL, remaining)
+
+
+def set_nonblocking_input(stdscr):
+    """Keep getch() from becoming a blocking tty read after resize/state churn."""
+    try:
+        stdscr.nodelay(True)
+    except Exception:
+        try:
+            stdscr.timeout(0)
+        except Exception:
+            pass
+
+
 def _version_tuple(text):
     parts = []
     for chunk in str(text).split("."):
@@ -1594,7 +1613,11 @@ def draw_detail(stdscr, curses, attrs, width, height, snapshot, detail, offset,
 
 def run_tui(stdscr, curses, fetcher, view):
     curses.curs_set(0)
-    stdscr.timeout(int(_FRAME_INTERVAL * 1000))  # ~20 Hz animation clock
+    # Never rely on curses' timeout mode for liveness. In long kubectl exec
+    # sessions we have observed getch() fall back to a blocking tty read, while
+    # background fetch threads kept running. nodelay + explicit pacing keeps
+    # the UI thread awake even if terminal state is churned by resize/pty events.
+    set_nonblocking_input(stdscr)
     try:
         curses.mousemask(curses.BUTTON4_PRESSED | curses.BUTTON5_PRESSED)
     except (curses.error, AttributeError):
@@ -1619,6 +1642,11 @@ def run_tui(stdscr, curses, fetcher, view):
     while True:
         key = stdscr.getch()
         now = time.time()
+        if key == -1:
+            sleep_for = frame_sleep_seconds(now, last_frame)
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+                now = time.time()
         tick = now - last_frame >= _FRAME_INTERVAL
         if tick:
             frame += 1
@@ -1635,6 +1663,7 @@ def run_tui(stdscr, curses, fetcher, view):
                     curses.resizeterm(*size)
                 except curses.error:
                     pass
+                set_nonblocking_input(stdscr)
                 help_drawn = False
             height, width = size
             visible_rows = max(1, height)
@@ -1677,6 +1706,7 @@ def run_tui(stdscr, curses, fetcher, view):
                     curses.resizeterm(*size)
                 except curses.error:
                     pass
+                set_nonblocking_input(stdscr)
             height, width = size
             # lazily fetch the current mode's window on entry / mode switch
             stats_fetcher.request(statsview.days(), statsview.scope)
@@ -1766,6 +1796,7 @@ def run_tui(stdscr, curses, fetcher, view):
                 curses.resizeterm(*size)
             except curses.error:
                 pass
+            set_nonblocking_input(stdscr)
             dirty = True
         height, width = size
 

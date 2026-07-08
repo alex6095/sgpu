@@ -6,6 +6,20 @@ number so a client never falsely reports itself "behind the server".
 
 ---
 
+## 0.8.15 — Agent JSON and nonblocking TUI input
+
+- Added stable agent-oriented JSON output with `agent_schema: 1` via
+  `--json` on text commands such as `json`, `pods`, `apps`, `stats`,
+  `health`, and `version`; failures are JSON too where possible.
+- Fixed Windows direct stdout capture by avoiding UTF-8 BOM emission from the
+  client itself. Note: Windows PowerShell's native-to-native pipe can still
+  inject a BOM; direct process capture and `cmd` pipes are clean.
+- Fixed a long-running TUI freeze: the remote curses main thread could lose
+  its timeout and block forever in `getch()`/TTY read while background fetches
+  kept running. Input is now fully nonblocking with explicit 20 Hz pacing.
+
+---
+
 ## 0.8.14 — Help clarity and wrapped command color
 
 - Help now wraps every long explanation to the terminal width instead of

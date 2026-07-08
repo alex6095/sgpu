@@ -86,7 +86,8 @@ def _enable_ansi():
     if os.name == "nt":
         os.system("")  # nudges conhost/Windows Terminal into VT mode
     try:
-        sys.stdout.reconfigure(encoding="utf-8")
+        if sys.stdout.isatty():
+            sys.stdout.reconfigure(encoding="utf-8")
         sys.stderr.reconfigure(encoding="utf-8")
     except (AttributeError, OSError):
         pass
@@ -133,9 +134,151 @@ def _cols_param():
 
 def _print(text):
     if text is not None:
+        if hasattr(sys.stdout, "buffer") and not sys.stdout.isatty():
+            data = text.encode("utf-8")
+            if not text.endswith("\n"):
+                data += b"\n"
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
+            return
         sys.stdout.write(text)
         if not text.endswith("\n"):
             sys.stdout.write("\n")
+
+
+def _print_json(payload):
+    _print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _loads_json(text):
+    return json.loads((text or "").lstrip("\ufeff"))
+
+
+def _node_label(namespace):
+    ns = _expand_ns(namespace) or namespace or ""
+    if ns.endswith("-01"):
+        return "1"
+    if ns.endswith("-02"):
+        return "2"
+    return ns or "?"
+
+
+def _now_utc():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _agent_header(kind, namespace, ok=True, sgpu_version=None,
+                  generated_utc=None):
+    return {
+        "agent_schema": 1,
+        "kind": kind,
+        "ok": bool(ok),
+        "generated_utc": generated_utc or _now_utc(),
+        "sgpu_version": sgpu_version or __version__,
+        "node": {
+            "namespace": namespace,
+            "label": _node_label(namespace),
+        },
+    }
+
+
+def _agent_process(proc):
+    return {
+        "pid": proc.get("pid"),
+        "gpu_index": proc.get("gpu_index"),
+        "gpu_uuid": proc.get("gpu_uuid"),
+        "owner": proc.get("owner") or "?",
+        "pod": proc.get("pod"),
+        "pod_uid": proc.get("pod_uid"),
+        "mem_mib": proc.get("mem_mib"),
+        "sm_util": proc.get("sm_util"),
+        "started_utc": proc.get("started_utc"),
+        "cmd": proc.get("cmd") or "",
+        "attribution": proc.get("attribution"),
+    }
+
+
+def _agent_pod(row):
+    return {
+        "owner": row.get("owner") or "?",
+        "pod": row.get("pod"),
+        "phase": row.get("phase"),
+        "request": row.get("gpu"),
+        "active": row.get("active", 0),
+        "node": row.get("node"),
+        "age": row.get("age"),
+        "uid": row.get("uid"),
+        "start_iso": row.get("start_iso"),
+    }
+
+
+def _agent_snapshot(snapshot, namespace, kind="snapshot"):
+    payload = _agent_header(
+        kind, namespace, ok=True,
+        sgpu_version=snapshot.get("sgpu_version"),
+        generated_utc=snapshot.get("time_utc"))
+    payload["node"].update({
+        "name": snapshot.get("node"),
+    })
+    payload.update({
+        "source": snapshot.get("source"),
+        "driver": snapshot.get("driver"),
+        "raw_schema": snapshot.get("schema"),
+        "gpus": snapshot.get("gpus") or [],
+        "processes": [_agent_process(p)
+                      for p in snapshot.get("procs") or []],
+        "pods": [_agent_pod(p)
+                 for p in ((snapshot.get("pods") or {}).get("rows") or [])],
+        "pod_status": {
+            "ok": bool((snapshot.get("pods") or {}).get("ok")),
+            "source": (snapshot.get("pods") or {}).get("source"),
+            "error": (snapshot.get("pods") or {}).get("error"),
+        },
+        "free": snapshot.get("gpu_free"),
+        "storage": snapshot.get("storage"),
+    })
+    if snapshot.get("error"):
+        payload["error"] = snapshot.get("error")
+        payload["ok"] = False
+    return payload
+
+
+def _agent_stats(result, namespace, days, scope):
+    payload = _agent_header(
+        "stats", namespace, ok=True,
+        generated_utc=result.get("generated_utc"))
+    payload.update({
+        "days": int(days),
+        "scope": scope or result.get("scope") or "local",
+        "stats": result,
+    })
+    if result.get("notes"):
+        payload["notes"] = result.get("notes")
+    return payload
+
+
+def _agent_health(text, namespace):
+    text = (text or "").strip()
+    parts = dict(part.split("=", 1) for part in text.split()
+                 if "=" in part)
+    payload = _agent_header("health", namespace,
+                            ok=text.startswith("ok "))
+    payload.update({
+        "status": text.split()[0] if text else "unknown",
+        "message": text,
+        "gpus": int(parts["gpus"]) if parts.get("gpus", "").isdigit()
+        else None,
+        "source": parts.get("source"),
+    })
+    return payload
+
+
+def _agent_version(version, namespace):
+    payload = _agent_header(
+        "version", namespace, ok=True,
+        sgpu_version=version.get("sgpu_version"))
+    payload["version"] = version
+    return payload
 
 
 # --- update check -----------------------------------------------------------
@@ -325,6 +468,97 @@ def _text_path(command, number, no_color):
     }[command]
 
 
+def _stats_path(number, no_color, scope=None, json_format=False):
+    query = ["days=%d" % (number or 7)]
+    if json_format:
+        query.append("format=json")
+    else:
+        query.extend([_color_param(no_color), _cols_param()])
+    if scope and scope != "local":
+        query.append("scope=lab" if scope == "lab" else "scope=%s" % scope)
+    return "/stats?" + "&".join(query)
+
+
+def _json_scope(scope, namespace, all_nodes=False):
+    if all_nodes:
+        return "lab"
+    if not scope:
+        return "local"
+    key = str(scope).strip().lower()
+    if key in ("lab", "all"):
+        return "lab"
+    if key in ("local", "node", "this"):
+        return "local"
+    if key in ("1", "01", "node-1", "node-01"):
+        return "1"
+    if key in ("2", "02", "node-2", "node-02"):
+        return "2"
+    return key
+
+
+def _agent_json_for(namespace, pod, command, number, scope=None, quiet=False):
+    if command in ("once", "json", "apps", "pods"):
+        text = _fetch(namespace, pod, "/json", quiet=quiet)
+        if text is None:
+            return None
+        snapshot = _loads_json(text)
+        kind = {"once": "snapshot", "json": "snapshot",
+                "apps": "processes", "pods": "pods"}[command]
+        payload = _agent_snapshot(snapshot, namespace, kind=kind)
+        if command == "apps":
+            payload.pop("pods", None)
+            payload.pop("pod_status", None)
+            payload.pop("free", None)
+            payload.pop("storage", None)
+        elif command == "pods":
+            payload.pop("processes", None)
+            payload.pop("gpus", None)
+            payload.pop("free", None)
+            payload.pop("storage", None)
+        return payload
+    if command == "stats":
+        resolved_scope = _json_scope(scope, namespace)
+        stats_scope = "lab" if resolved_scope == "lab" else None
+        text = _fetch(namespace, pod, _stats_path(
+            number, True, scope=stats_scope, json_format=True), quiet=quiet)
+        if text is None:
+            return None
+        return _agent_stats(_loads_json(text), namespace,
+                            number or 7, resolved_scope)
+    if command == "health":
+        text = _fetch(namespace, pod, "/health", quiet=quiet)
+        if text is None:
+            return None
+        return _agent_health(text, namespace)
+    if command == "version":
+        text = _fetch(namespace, pod, "/version", quiet=quiet)
+        if text is None:
+            return None
+        return _agent_version(_loads_json(text), namespace)
+    text = _fetch(namespace, pod, _text_path(command, number, True),
+                  quiet=quiet)
+    if text is None:
+        return None
+    payload = _agent_header(command, namespace, ok=True)
+    payload["text"] = text
+    return payload
+
+
+def _emit_agent_error(namespace, error):
+    return {
+        "agent_schema": 1,
+        "kind": "node_result",
+        "ok": False,
+        "generated_utc": _now_utc(),
+        "sgpu_version": __version__,
+        "node": {
+            "namespace": namespace,
+            "label": _node_label(namespace),
+        },
+        "error": error,
+    }
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="sgpu",
@@ -344,11 +578,21 @@ def main(argv=None):
     parser.add_argument("-r", "--refresh", type=int, default=2,
                         help="TUI/watch refresh interval (default 2)")
     parser.add_argument("--no-color", action="store_true")
+    parser.add_argument("--json", action="store_true",
+                        help="emit stable agent_schema=1 JSON for text commands")
+    parser.add_argument("--scope", default=None,
+                        help="stats JSON scope: local, 1, 2, or lab")
     parser.add_argument("-V", "--version", action="version",
                         version="sgpu " + __version__)
     args = parser.parse_args(argv)
 
     if shutil.which("kubectl") is None:
+        if args.json:
+            payload = _agent_header(args.command, _resolve_namespace(
+                args.namespace), ok=False)
+            payload["error"] = "kubectl not found on PATH"
+            _print_json(payload)
+            return 127
         print("sgpu: kubectl not found on PATH", file=sys.stderr)
         print("hint: install kubectl and configure the MLXP kubeconfig "
               "(see the sgpu README)", file=sys.stderr)
@@ -363,6 +607,10 @@ def main(argv=None):
     _enable_ansi()
 
     if args.command in INTERACTIVE:
+        if args.json:
+            print("sgpu: --json cannot be used with interactive '%s'"
+                  % args.command, file=sys.stderr)
+            return 2
         namespace = _resolve_namespace(args.namespace)
         if args.command == "watch":
             return _watch(namespace, args.pod,
@@ -375,6 +623,68 @@ def main(argv=None):
                              "python3", "/opt/gpu-monitor/tui.py",
                              str(args.refresh)])
         return _interactive(namespace, args.pod, pod_command, args.no_color)
+
+    if args.json:
+        if args.all and args.command == "stats":
+            preferred = _resolve_namespace(args.namespace)
+            for ns in [preferred] + [n for n in NODES if n != preferred]:
+                try:
+                    payload = _agent_json_for(
+                        ns, args.pod, "stats", args.number,
+                        scope="lab", quiet=True)
+                except Exception:
+                    payload = None
+                if payload is not None:
+                    _print_json(payload)
+                    return 0
+            _print_json(_emit_agent_error("all",
+                                          "no reachable monitor pod"))
+            return 1
+        if args.all:
+            nodes = []
+            succeeded = False
+            for ns in NODES:
+                try:
+                    payload = _agent_json_for(ns, args.pod, args.command,
+                                              args.number, args.scope,
+                                              quiet=True)
+                except Exception as exc:
+                    payload = _emit_agent_error(
+                        ns, "%s: %s" % (type(exc).__name__, exc))
+                if payload is None:
+                    nodes.append(_emit_agent_error(
+                        ns, "monitor pod unreachable"))
+                    continue
+                nodes.append(payload)
+                succeeded = True
+            _print_json({
+                "agent_schema": 1,
+                "kind": args.command + "_all",
+                "ok": succeeded,
+                "generated_utc": _now_utc(),
+                "sgpu_version": __version__,
+                "nodes": nodes,
+            })
+            return 0 if succeeded else 1
+        namespace = _resolve_namespace(args.namespace)
+        if args.command == "stats":
+            scope = _json_scope(args.scope, namespace)
+            if scope in ("1", "2"):
+                namespace = _expand_ns(scope)
+        else:
+            scope = args.scope
+        try:
+            payload = _agent_json_for(namespace, args.pod, args.command,
+                                      args.number, scope, quiet=True)
+        except Exception as exc:
+            payload = _emit_agent_error(
+                namespace, "%s: %s" % (type(exc).__name__, exc))
+        if payload is None:
+            _print_json(_emit_agent_error(namespace,
+                                          "monitor pod unreachable"))
+            return 1
+        _print_json(payload)
+        return 0 if payload.get("ok") else 1
 
     path = _text_path(args.command, args.number, args.no_color)
 

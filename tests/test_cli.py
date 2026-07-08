@@ -9,6 +9,7 @@ interactive commands.
 import os
 import sys
 import unittest
+from io import BytesIO
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "sgpu"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -163,3 +164,60 @@ class TestVersionCompare(unittest.TestCase):
     def test_version_tuple(self):
         self.assertEqual(cli._version_tuple("0.8.3"), (0, 8, 3))
         self.assertEqual(cli._version_tuple("1.2.3rc1"), (1, 2, 3))
+
+
+class _FakePipe:
+    def __init__(self):
+        self.buffer = BytesIO()
+
+    def isatty(self):
+        return False
+
+    def write(self, text):
+        self.buffer.write(text.encode("utf-8"))
+
+    def flush(self):
+        pass
+
+
+class TestAgentJson(unittest.TestCase):
+    def test_print_pipe_has_no_utf8_bom(self):
+        saved = sys.stdout
+        fake = _FakePipe()
+        try:
+            sys.stdout = fake
+            cli._print('{"ok": true}')
+        finally:
+            sys.stdout = saved
+        raw = fake.buffer.getvalue()
+        self.assertTrue(raw.startswith(b"{"))
+        self.assertNotEqual(raw[:3], b"\xef\xbb\xbf")
+
+    def test_agent_snapshot_has_stable_v1_shape(self):
+        snap = {
+            "schema": 2,
+            "source": "nvml",
+            "time_utc": "2026-07-09T00:00:00Z",
+            "node": "h200-04-w-4b11",
+            "driver": "580.126.16",
+            "sgpu_version": "0.8.14",
+            "gpus": [{"index": 0, "util": 90}],
+            "procs": [{"pid": 7, "gpu_index": 0, "owner": "ty",
+                       "pod": "ty-job", "cmd": "python train.py"}],
+            "pods": {"ok": True, "source": "kube", "rows": [{
+                "owner": "ty", "pod": "ty-job", "phase": "Running",
+                "gpu": 1, "active": 1, "uid": "u"}]},
+            "gpu_free": {"free": 0, "total": 8},
+        }
+        out = cli._agent_snapshot(snap, "p-sgvr-node-02")
+        self.assertEqual(out["agent_schema"], 1)
+        self.assertEqual(out["kind"], "snapshot")
+        self.assertEqual(out["node"]["label"], "2")
+        self.assertEqual(out["raw_schema"], 2)
+        self.assertEqual(out["processes"][0]["cmd"], "python train.py")
+        self.assertEqual(out["pods"][0]["request"], 1)
+
+    def test_agent_stats_scope_mapping(self):
+        self.assertEqual(cli._json_scope("lab", "p-sgvr-node-02"), "lab")
+        self.assertEqual(cli._json_scope("1", "p-sgvr-node-02"), "1")
+        self.assertEqual(cli._json_scope(None, "p-sgvr-node-02"), "local")

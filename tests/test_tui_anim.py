@@ -89,6 +89,16 @@ class TestStatsSpinner(unittest.TestCase):
                       tui.STATS_SPIN_ASCII)
 
 
+class TestNonblockingInputPacing(unittest.TestCase):
+    def test_frame_sleep_seconds_until_next_frame(self):
+        self.assertAlmostEqual(
+            tui.frame_sleep_seconds(10.0, 10.0), tui._FRAME_INTERVAL)
+        self.assertGreater(tui.frame_sleep_seconds(
+            10.01, 10.0), 0.0)
+        self.assertEqual(tui.frame_sleep_seconds(
+            10.0 + tui._FRAME_INTERVAL, 10.0), 0.0)
+
+
 class TestLayoutGutter(unittest.TestCase):
     def _snap(self):
         return {"gpus": [{"index": 0, "name": "H200", "util": 90,

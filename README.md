@@ -60,8 +60,8 @@ sgpu --all stats      ONE lab-wide merged report: combined leaderboard,
 sgpu once             uses your current kubectl context's namespace
 ```
 
-In the TUI stats screen, `n` toggles the same thing: LOCAL (this node) ↔
-LAB (all nodes combined, with each owner's home node).
+In the dashboard TUI, `n` switches node 1/2 without relaunching. In the stats
+screen, `n` cycles the current node, the other node, and `LAB`.
 
 TUI keys:
 
@@ -78,9 +78,20 @@ r         refresh
 q         quit
 ```
 
-Options: `-n` namespace, `--pod`, `-r` refresh, `--no-color`.
+Options: `-n` namespace, `--pod`, `-r` refresh, `--no-color`, `--json`
+for stable agent-readable JSON on text commands.
 Env: `SGPU_NAMESPACE`, `SGPU_POD`, `SGPU_NO_UPDATE_CHECK=1` (silence the
 upgrade nudge).
+
+Agent-friendly examples:
+
+```bash
+sgpu -n 2 json --json
+sgpu -n 2 pods --json
+sgpu -n 2 apps --json
+sgpu -n 2 stats 14 --json --scope lab
+sgpu --all json --json
+```
 
 ### Staying up to date
 
