@@ -126,10 +126,15 @@ def layout_header(snapshot, width):
     free = snapshot.get("gpu_free") or {}
     if free.get("total"):
         count = free.get("free", 0)
-        badge = "[%d/%d free]" % (count, free["total"])
-        if free.get("basis") == "process":
-            badge = "[~%d/%d free]" % (count, free["total"])  # estimate
-        segments.append((badge, "ok" if count > 0 else "crit"))
+        prefix = "~" if free.get("basis") == "process" else ""
+        idle = free.get("idle_reserved", 0)
+        # "[1/8 free +1 idle]": 1 requestable right now, 1 more reserved by
+        # an idle pod (physically unused, reclaimable if the holder quits).
+        segments.append(("[%s%d/%d free" % (prefix, count, free["total"]),
+                         "ok" if count > 0 else "crit"))
+        if idle > 0:
+            segments.append((" +%d idle" % idle, "warn"))
+        segments.append(("]", "ok" if count > 0 else "crit"))
         segments.append(("  ", "plain"))
     segments.append((clip("node=%s  driver=%s  %s" % (
         snapshot.get("node", "?"), snapshot.get("driver", "?"), stamp),

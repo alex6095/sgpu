@@ -131,7 +131,7 @@ Press `?` in the TUI for this same reference in-app.
 
 | Column | Meaning |
 | --- | --- |
-| `[N/M free]` | Header badge: GPUs a **new pod could still request** on this node (total minus pods' GPU requests — an idle-but-reserved GPU is not free). Green when >0, red when full. `~N/M` = process-based estimate (pod API unavailable). |
+| `[N/M free +K idle]` | Header badge: `N` = GPUs a **new pod could request right now** (total minus pods' GPU requests; green >0, red 0). `+K idle` (yellow) = GPUs **reserved by Running pods that aren't using them** — physically idle and reclaimable if the holder releases them. `~N/M` = process-based estimate (pod API unavailable). |
 | `UTIL` | Whole-GPU utilization %: share of time the GPU did **any** work (NVML/nvidia-smi). |
 | `SM%` | Per-**process** SM (streaming-multiprocessor) activity — how hard that process drove the GPU cores. |
 | `MEM` / `PEAK-MEM` | GPU memory in use / highest seen (each H200 ≈ 140 GiB). |

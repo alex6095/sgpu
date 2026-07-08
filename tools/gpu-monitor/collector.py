@@ -23,7 +23,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
-SGPU_VERSION = "0.8.2"
+SGPU_VERSION = "0.8.3"
 SCHEMA = 2
 
 MOCK = os.environ.get("SGPU_MOCK", "") == "1"
@@ -559,12 +559,21 @@ def collect(include_pods=True, force=False):
         if pods.get("ok"):
             allocated = sum(int(row.get("gpu") or 0)
                             for row in pods.get("rows", []))
+            # Reserved-but-unused: Running pods holding more GPUs than they
+            # have processes on. Not requestable right now, but reclaimable
+            # if the holder releases — worth surfacing separately.
+            idle_reserved = sum(
+                max(0, int(row.get("gpu") or 0) - int(row.get("active") or 0))
+                for row in pods.get("rows", [])
+                if row.get("phase") == "Running")
             gpu_free = {"free": max(0, total_gpus - allocated),
-                        "total": total_gpus, "basis": "allocation"}
+                        "total": total_gpus, "basis": "allocation",
+                        "idle_reserved": idle_reserved}
         else:
             idle = sum(1 for g in gpus if not g.get("owners")
                        and (g.get("mem_used_mib") or 0) < 1024)
-            gpu_free = {"free": idle, "total": total_gpus, "basis": "process"}
+            gpu_free = {"free": idle, "total": total_gpus, "basis": "process",
+                        "idle_reserved": 0}
 
         snapshot = {
             "schema": SCHEMA,
