@@ -11,6 +11,7 @@ namespace is used.
 """
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -135,6 +136,89 @@ def _print(text):
         sys.stdout.write(text)
         if not text.endswith("\n"):
             sys.stdout.write("\n")
+
+
+# --- update check -----------------------------------------------------------
+# The server (monitor image) is upgraded centrally; the pip client is not.
+# When the client falls behind the server, nudge the user to upgrade. The
+# server version is cached for 6h so we don't add a round trip per command.
+
+UPDATE_CHECK_TTL = 6 * 3600
+_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "sgpu")
+
+
+def _version_tuple(text):
+    parts = []
+    for chunk in str(text).split("."):
+        digits = ""
+        for ch in chunk:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def _is_outdated(client, server):
+    if not server or not client:
+        return False
+    try:
+        return _version_tuple(client) < _version_tuple(server)
+    except Exception:
+        return False
+
+
+def _read_cached_server_version():
+    try:
+        with open(os.path.join(_CACHE_DIR, "update.json")) as fh:
+            data = json.load(fh)
+        return data.get("server_version"), data.get("checked_at", 0)
+    except Exception:
+        return None, 0
+
+
+def _write_cached_server_version(server_version):
+    try:
+        os.makedirs(_CACHE_DIR, exist_ok=True)
+        with open(os.path.join(_CACHE_DIR, "update.json"), "w") as fh:
+            json.dump({"server_version": server_version,
+                       "checked_at": time.time()}, fh)
+    except Exception:
+        pass
+
+
+def _server_version(namespace, pod):
+    """Cached server version; refreshes via /version when stale (after the
+    command's own output, so it never delays what the user asked for)."""
+    server, checked_at = _read_cached_server_version()
+    if server is not None and (time.time() - checked_at) <= UPDATE_CHECK_TTL:
+        return server
+    out = _fetch(namespace, pod, "/version", quiet=True)
+    if out:
+        try:
+            fresh = json.loads(out).get("sgpu_version")
+        except Exception:
+            fresh = None
+        if fresh:
+            _write_cached_server_version(fresh)
+            return fresh
+    return server
+
+
+def _emit_update_notice(namespace, pod, no_color):
+    if os.environ.get("SGPU_NO_UPDATE_CHECK") == "1" \
+            or not sys.stderr.isatty():
+        return
+    server = _server_version(namespace, pod)
+    if not _is_outdated(__version__, server):
+        return
+    msg = ("sgpu %s is available (you have %s) — upgrade: pip install -U sgpu"
+           % (server, __version__))
+    if no_color:
+        print("\n^ " + msg, file=sys.stderr)
+    else:
+        print("\n\x1b[1;33m↑ %s\x1b[0m" % msg, file=sys.stderr)
 
 
 # Restore sequences for when the remote TUI dies without cleanup (pod
@@ -272,8 +356,11 @@ def main(argv=None):
         if args.command == "watch":
             return _watch(namespace, args.pod,
                           args.number or args.refresh, args.no_color)
+        # Hand the client version to the in-pod TUI so it can show an
+        # upgrade banner when this client is behind the server.
         pod_command = (["nvitop"] if args.command == "nvitop"
-                       else ["python3", "/opt/gpu-monitor/tui.py",
+                       else ["env", "SGPU_CLIENT_VERSION=" + __version__,
+                             "python3", "/opt/gpu-monitor/tui.py",
                              str(args.refresh)])
         return _interactive(namespace, args.pod, pod_command, args.no_color)
 
@@ -287,12 +374,14 @@ def main(argv=None):
             text = _fetch(ns, args.pod, path + "&scope=lab", quiet=True)
             if text is not None:
                 _print(text)
+                _emit_update_notice(ns, args.pod, args.no_color)
                 return 0
         print("sgpu: no reachable monitor pod on any node", file=sys.stderr)
         return 1
 
     if args.all:
         succeeded = False
+        used_ns = None
         for ns in NODES:
             print("\x1b[1;36m=== %s ===\x1b[0m" % ns
                   if sys.stdout.isatty() and not args.no_color
@@ -304,6 +393,9 @@ def main(argv=None):
             _print(text)
             print("")
             succeeded = True
+            used_ns = ns
+        if used_ns:
+            _emit_update_notice(used_ns, args.pod, args.no_color)
         return 0 if succeeded else 1
 
     namespace = _resolve_namespace(args.namespace)
@@ -311,6 +403,7 @@ def main(argv=None):
     if text is None:
         return 1
     _print(text)
+    _emit_update_notice(namespace, args.pod, args.no_color)
     return 0
 
 

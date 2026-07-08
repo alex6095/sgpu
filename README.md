@@ -72,7 +72,17 @@ q         quit
 ```
 
 Options: `-n` namespace, `--pod`, `-r` refresh, `--no-color`.
-Env: `SGPU_NAMESPACE`, `SGPU_POD`.
+Env: `SGPU_NAMESPACE`, `SGPU_POD`, `SGPU_NO_UPDATE_CHECK=1` (silence the
+upgrade nudge).
+
+### Staying up to date
+
+The monitor **server** is upgraded centrally (one image redeploy updates the
+dashboard/stats UI for everyone — no client action needed). The **client**
+(this pip package) only changes for client-side features (`-n`, `--all`,
+reconnect). When your client falls behind the server, sgpu shows a yellow
+`↑ update available` banner in the TUI and a one-line hint after text
+commands — just run `pip install -U sgpu` (or `uv tool upgrade sgpu`).
 
 ## Screenshots
 

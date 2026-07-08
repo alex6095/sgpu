@@ -176,6 +176,37 @@ def bucketize(value, row_max):
     return level
 
 
+def _version_tuple(text):
+    parts = []
+    for chunk in str(text).split("."):
+        digits = ""
+        for ch in chunk:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def update_banner_segments(snapshot):
+    """Yellow upgrade banner when the launching client (SGPU_CLIENT_VERSION)
+    is behind this server's version. Returns segments or None."""
+    client = os.environ.get("SGPU_CLIENT_VERSION")
+    server = (snapshot or {}).get("sgpu_version")
+    if not client or not server:
+        return None
+    try:
+        if _version_tuple(client) >= _version_tuple(server):
+            return None
+    except Exception:
+        return None
+    return [("↑ update available: ", "warn"),
+            ("sgpu %s" % server, "header"),
+            (" (you have %s) — run: " % client, "dim"),
+            ("pip install -U sgpu", "warn")]
+
+
 def owner_series_from_columns(columns, owner):
     """Extract one owner's per-column values from a list of (label, owners)."""
     return [(owners or {}).get(owner, 0.0) for _label, owners in columns]
@@ -1186,6 +1217,7 @@ def run_tui(stdscr, curses, fetcher, view):
         dirty = False
 
         filtered = dict(shown, procs=procs)
+        banner_segs = update_banner_segments(shown)
         header_lines = render.layout_header(shown, width)
         gpu_lines = render.layout_gpus(shown, width, bars_unicode)
         storage_lines = render.layout_storage(shown, width, bars_unicode)
@@ -1193,10 +1225,11 @@ def run_tui(stdscr, curses, fetcher, view):
         pod_layout = render.layout_pods(dict(shown, pods=dict(
             shown.get("pods") or {}, rows=pods)), width)
 
-        # Vertical budget: header 1 + blank + gpus + blank + procs header 2
-        # + procs rows (flex) + blank + pods (<=8, collapses first) + footer.
-        fixed_top = len(header_lines) + 1 + len(gpu_lines) \
-            + len(storage_lines) + 1 + len(proc_layout["header"])
+        # Vertical budget: [banner] + header 1 + blank + gpus + blank + procs
+        # header 2 + procs rows (flex) + blank + pods (<=8) + footer.
+        fixed_top = (1 if banner_segs else 0) + len(header_lines) + 1 \
+            + len(gpu_lines) + len(storage_lines) + 1 \
+            + len(proc_layout["header"])
         pods_block = 1 + len(pod_layout["header"]) \
             + min(len(pod_layout["rows"]), 6)
         if height < 24:
@@ -1209,6 +1242,9 @@ def run_tui(stdscr, curses, fetcher, view):
 
         stdscr.erase()
         y = 0
+        if banner_segs:
+            draw_segments(stdscr, curses, y, banner_segs, attrs, width)
+            y += 1
         for line in header_lines:
             age = time.time() - fetched_at
             status = "  %s%s" % ("PAUSED  " if view.paused else "",

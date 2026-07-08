@@ -145,3 +145,21 @@ class TestInteractiveReconnect(unittest.TestCase):
             raise KeyboardInterrupt()
         cli.subprocess.call = raise_interrupt
         self.assertEqual(cli._interactive("ns", "pod", ["x"], False), 130)
+
+
+class TestVersionCompare(unittest.TestCase):
+    def test_outdated(self):
+        self.assertTrue(cli._is_outdated("0.7.0", "0.8.3"))
+        self.assertTrue(cli._is_outdated("0.8.2", "0.8.3"))
+
+    def test_current_or_ahead(self):
+        self.assertFalse(cli._is_outdated("0.8.3", "0.8.3"))
+        self.assertFalse(cli._is_outdated("0.9.0", "0.8.3"))
+
+    def test_missing_versions(self):
+        self.assertFalse(cli._is_outdated("0.8.3", None))
+        self.assertFalse(cli._is_outdated(None, "0.8.3"))
+
+    def test_version_tuple(self):
+        self.assertEqual(cli._version_tuple("0.8.3"), (0, 8, 3))
+        self.assertEqual(cli._version_tuple("1.2.3rc1"), (1, 2, 3))
