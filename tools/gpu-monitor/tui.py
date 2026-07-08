@@ -15,6 +15,7 @@ import json
 import locale
 import os
 import sys
+import textwrap
 import threading
 import time
 import urllib.request
@@ -28,6 +29,11 @@ _term = os.environ.get("TERM", "")
 if "256" not in _term and _term in (
         "", "xterm", "ansi", "vt100", "vt220", "linux", "screen", "tmux"):
     os.environ["TERM"] = "xterm-256color"
+
+# Make a lone Esc register fast (default ncurses ESCDELAY is ~1s, which makes
+# leaving the help/stats/detail screens feel laggy). Must be set before
+# curses initializes.
+os.environ.setdefault("ESCDELAY", "25")
 
 import render
 
@@ -389,7 +395,9 @@ class View:
         self.sort = "gpu"
         self.owner_filter = None
         self.paused = False
-        self.screen = "dash"          # dash | stats
+        self.screen = "dash"          # dash | stats | detail
+        self.detail = None
+        self.detail_offset = 0
 
     def visible_procs(self, snapshot):
         procs = list(snapshot.get("procs", []))
@@ -446,6 +454,36 @@ class View:
             self.offset[pane] = self.selected[pane] - view_height + 1
         max_offset = max(0, row_count - view_height)
         self.offset[pane] = max(0, min(max_offset, self.offset[pane]))
+
+    def open_detail(self, procs, pods):
+        if self.focus == "procs":
+            if not procs:
+                return False
+            proc = procs[max(0, min(self.selected["procs"], len(procs) - 1))]
+            self.detail = {
+                "kind": "proc",
+                "pid": proc.get("pid"),
+                "started_utc": proc.get("started_utc"),
+                "pod": proc.get("pod"),
+                "snapshot": dict(proc),
+            }
+        else:
+            if not pods:
+                return False
+            pod = pods[max(0, min(self.selected["pods"], len(pods) - 1))]
+            self.detail = {
+                "kind": "pod",
+                "pod": pod.get("pod"),
+                "uid": pod.get("uid"),
+                "snapshot": dict(pod),
+            }
+        self.detail_offset = 0
+        self.screen = "detail"
+        return True
+
+    def close_detail(self):
+        self.screen = "dash"
+        self.detail_offset = 0
 
 
 class StatsFetcher(threading.Thread):
@@ -946,6 +984,8 @@ def help_lines():
     lines.append(("", "plain"))
 
     lines.append(("Keys", "section"))
+    lines.append(("  detail: Enter opens the selected process/pod; "
+                  "Enter or Esc returns; j/k scrolls; r refreshes", "plain"))
     lines.append(("  dashboard: j/k,arrows scroll · Tab switch pane "
                   "(processes/pods) · s sort · o owner filter · p pause · "
                   "r refresh · t stats screen · ? help · q quit", "plain"))
@@ -1033,6 +1073,298 @@ def draw_help(stdscr, curses, attrs, width, height, offset):
         segs = line if isinstance(line, list) else [line]
         draw_segments(stdscr, curses, y, segs, attrs, width)
         y += 1
+    stdscr.refresh()
+    return offset
+
+
+def is_enter_key(curses, key):
+    return key in (10, 13, getattr(curses, "KEY_ENTER", -9999))
+
+
+def _value(value):
+    if value is None or value == "":
+        return "?"
+    return str(value)
+
+
+def _pct(value):
+    return ("%d%%" % value) if value is not None else "?"
+
+
+def _started(value):
+    return str(value).replace("T", " ").replace("Z", " UTC") if value else "?"
+
+
+def _gpu_label(proc):
+    index = proc.get("gpu_index")
+    uuid = proc.get("gpu_uuid")
+    if index is None:
+        return _value(uuid)
+    if uuid:
+        return "%s / %s" % (index, uuid)
+    return str(index)
+
+
+def _find_proc(snapshot, ref):
+    pid = (ref or {}).get("pid")
+    started = (ref or {}).get("started_utc")
+    for proc in snapshot.get("procs", []) or []:
+        if pid is not None and proc.get("pid") == pid:
+            return proc, True
+    pod = (ref or {}).get("pod")
+    if started and pod:
+        for proc in snapshot.get("procs", []) or []:
+            if proc.get("started_utc") == started and proc.get("pod") == pod:
+                return proc, True
+    return ((ref or {}).get("snapshot") or {}), False
+
+
+def _find_pod(snapshot, ref):
+    rows = ((snapshot.get("pods") or {}).get("rows") or [])
+    uid = ((ref or {}).get("uid") or "").lower()
+    if uid:
+        for pod in rows:
+            if (pod.get("uid") or "").lower() == uid:
+                return pod, True
+    name = (ref or {}).get("pod")
+    if name:
+        for pod in rows:
+            if pod.get("pod") == name:
+                return pod, True
+    return ((ref or {}).get("snapshot") or {}), False
+
+
+def _pod_for_proc(snapshot, proc):
+    rows = ((snapshot.get("pods") or {}).get("rows") or [])
+    uid = (proc.get("pod_uid") or "").lower()
+    if uid:
+        for pod in rows:
+            if (pod.get("uid") or "").lower() == uid:
+                return pod, True
+    name = proc.get("pod")
+    if name:
+        for pod in rows:
+            if pod.get("pod") == name:
+                return pod, True
+    return {}, False
+
+
+def _gpu_for_proc(snapshot, proc):
+    idx = proc.get("gpu_index")
+    uuid = proc.get("gpu_uuid")
+    for gpu in snapshot.get("gpus", []) or []:
+        if idx is not None and gpu.get("index") == idx:
+            return gpu
+        if uuid and gpu.get("uuid") == uuid:
+            return gpu
+    return {}
+
+
+def _related_procs(snapshot, pod_name):
+    if not pod_name:
+        return []
+    rows = [p for p in snapshot.get("procs", []) or []
+            if p.get("pod") == pod_name]
+    return sorted(rows, key=lambda p: (
+        p.get("gpu_index") if p.get("gpu_index") is not None else 999,
+        p.get("pid") or 0))
+
+
+def _append_kv(lines, label, value, tag="plain", width=120):
+    prefix = "  %-12s " % (label + ":")
+    lines.append([(prefix, "header"),
+                  (render.clip(_value(value), max(1, width - len(prefix))),
+                   tag)])
+
+
+def _append_wrapped(lines, label, value, tag="plain", width=120):
+    prefix = "  %-12s " % (label + ":")
+    body_width = max(12, width - len(prefix))
+    text = _value(value)
+    chunks = textwrap.wrap(text, body_width, break_long_words=True,
+                           replace_whitespace=False) or ["?"]
+    lines.append([(prefix, "header"), (chunks[0], tag)])
+    indent = " " * len(prefix)
+    for chunk in chunks[1:]:
+        lines.append([(indent, "plain"), (chunk, tag)])
+
+
+def _append_pod_fields(lines, pod, width):
+    owner = pod.get("owner") or "?"
+    _append_kv(lines, "Owner", owner, render.owner_tag(owner), width)
+    _append_kv(lines, "Pod", pod.get("pod"), render.owner_tag(owner), width)
+    _append_kv(lines, "Phase", pod.get("phase"), "plain", width)
+    _append_kv(lines, "Request", pod.get("gpu"), "plain", width)
+    _append_kv(lines, "Active", pod.get("active", 0), "plain", width)
+    _append_kv(lines, "Age", pod.get("age"), "plain", width)
+    _append_kv(lines, "Node", pod.get("node"), "plain", width)
+    _append_kv(lines, "UID", pod.get("uid"), "dim", width)
+    _append_kv(lines, "Started", _started(pod.get("start_iso")), "dim", width)
+
+
+def _append_gpu_fields(lines, gpu, width):
+    if not gpu:
+        lines.append([("  no matching GPU row in current snapshot", "warn")])
+        return
+    owners = ", ".join(gpu.get("owners") or []) or "-"
+    mem = "%s/%s" % (render.fmt_gib(gpu.get("mem_used_mib")),
+                     render.fmt_gib(gpu.get("mem_total_mib")))
+    power = "%s/%sW" % (
+        "%d" % gpu.get("power_w") if gpu.get("power_w") is not None else "?",
+        "%d" % gpu.get("power_limit_w")
+        if gpu.get("power_limit_w") is not None else "?")
+    _append_kv(lines, "GPU", gpu.get("index"), "plain", width)
+    _append_kv(lines, "Util", _pct(gpu.get("util")),
+               render.util_tag(gpu.get("util")), width)
+    _append_kv(lines, "Memory", mem, "plain", width)
+    _append_kv(lines, "Temp", ("%dC" % gpu.get("temp_c"))
+               if gpu.get("temp_c") is not None else "?", "plain", width)
+    _append_kv(lines, "Power", power, "plain", width)
+    _append_kv(lines, "Owners", owners, "plain", width)
+    _append_kv(lines, "UUID", gpu.get("uuid"), "dim", width)
+
+
+def _append_related_procs(lines, procs, width, now):
+    lines.append([("Related processes in pod", "section")])
+    if not procs:
+        lines.append([("  no live NVIDIA compute processes for this pod",
+                       "dim")])
+        return
+    header = "%3s  %7s  %4s  %7s  %7s  %s" % (
+        "GPU", "PID", "SM%", "MEM", "UP", "CMD")
+    lines.append([(render.clip(header, width), "header")])
+    fixed = 3 + 2 + 7 + 2 + 4 + 2 + 7 + 2 + 7 + 2
+    cmd_w = max(8, width - fixed)
+    for proc in procs:
+        sm = proc.get("sm_util")
+        row = "%3s  %7s  %4s  %7s  %7s  %s" % (
+            proc.get("gpu_index") if proc.get("gpu_index") is not None else "?",
+            proc.get("pid", "?"),
+            ("%d" % sm) if sm is not None else "-",
+            render.fmt_gib(proc.get("mem_mib")),
+            render.fmt_uptime(proc.get("started_utc"), now),
+            render.clip(proc.get("cmd") or "?", cmd_w))
+        lines.append([(render.clip(row, width),
+                       render.util_tag(sm) if sm is not None else "plain")])
+
+
+def detail_lines(snapshot, detail, width, now=None, unicode=True):
+    """Build scrollable detail-screen lines for a selected process or pod."""
+    now = now or time.time()
+    lines = []
+    if not detail:
+        return [[("SGPU detail", "title")],
+                [("  no selected row", "warn")]]
+
+    kind = detail.get("kind")
+    if kind == "proc":
+        proc, live = _find_proc(snapshot, detail)
+        owner = proc.get("owner") or "?"
+        pod, pod_live = _pod_for_proc(snapshot, proc)
+        gpu = _gpu_for_proc(snapshot, proc)
+        title = "SGPU detail: process pid=%s" % _value(proc.get("pid"))
+        lines.append([(render.clip(title, width), "title"),
+                      ("  live" if live else "  stale", "ok" if live else "warn")])
+        lines.append(render.divider(width, unicode))
+        if not live:
+            lines.append([("  selected process is no longer visible; "
+                           "showing last known values", "warn")])
+        lines.append([("Process", "section")])
+        _append_kv(lines, "Owner", owner, render.owner_tag(owner), width)
+        _append_kv(lines, "Pod", proc.get("pod"), render.owner_tag(owner),
+                   width)
+        _append_kv(lines, "PID", proc.get("pid"), "plain", width)
+        _append_kv(lines, "GPU", _gpu_label(proc), "plain", width)
+        _append_kv(lines, "SM", _pct(proc.get("sm_util")),
+                   render.util_tag(proc.get("sm_util")), width)
+        _append_kv(lines, "Memory", render.fmt_gib(proc.get("mem_mib")),
+                   "plain", width)
+        _append_kv(lines, "Uptime",
+                   render.fmt_uptime(proc.get("started_utc"), now), "plain",
+                   width)
+        _append_kv(lines, "Started", _started(proc.get("started_utc")),
+                   "dim", width)
+        _append_kv(lines, "Attrib", proc.get("attribution"), "dim", width)
+        _append_wrapped(lines, "Command", proc.get("cmd"), "dim", width)
+        lines.append(render.divider(width, unicode))
+        lines.append([("GPU", "section")])
+        _append_gpu_fields(lines, gpu, width)
+        lines.append(render.divider(width, unicode))
+        lines.append([("Kubernetes pod", "section")])
+        if pod:
+            if not pod_live:
+                lines.append([("  matching pod row is not in current pod view",
+                               "warn")])
+            _append_pod_fields(lines, pod, width)
+        else:
+            lines.append([("  no matching GPU-requesting pod row", "warn")])
+        lines.append(render.divider(width, unicode))
+        _append_related_procs(lines, _related_procs(snapshot, proc.get("pod")),
+                              width, now)
+        return lines
+
+    pod, live = _find_pod(snapshot, detail)
+    owner = pod.get("owner") or "?"
+    title = "SGPU detail: pod %s" % _value(pod.get("pod"))
+    lines.append([(render.clip(title, width), "title"),
+                  ("  live" if live else "  stale", "ok" if live else "warn")])
+    lines.append(render.divider(width, unicode))
+    if not live:
+        lines.append([("  selected pod is no longer visible; showing last "
+                       "known values", "warn")])
+    lines.append([("Kubernetes pod", "section")])
+    _append_pod_fields(lines, pod, width)
+    related = _related_procs(snapshot, pod.get("pod"))
+    active_gpus = []
+    seen = set()
+    for proc in related:
+        idx = proc.get("gpu_index")
+        if idx is not None and idx not in seen:
+            seen.add(idx)
+            active_gpus.append(_gpu_for_proc(snapshot, proc))
+    lines.append(render.divider(width, unicode))
+    lines.append([("Active GPUs", "section")])
+    if active_gpus:
+        for gpu in active_gpus:
+            util = gpu.get("util")
+            text = "  GPU %s  util=%s  mem=%s/%s  temp=%s  power=%s/%sW" % (
+                gpu.get("index", "?"), _pct(util),
+                render.fmt_gib(gpu.get("mem_used_mib")),
+                render.fmt_gib(gpu.get("mem_total_mib")),
+                ("%dC" % gpu.get("temp_c"))
+                if gpu.get("temp_c") is not None else "?",
+                "%d" % gpu.get("power_w")
+                if gpu.get("power_w") is not None else "?",
+                "%d" % gpu.get("power_limit_w")
+                if gpu.get("power_limit_w") is not None else "?")
+            lines.append([(render.clip(text, width), render.util_tag(util))])
+    else:
+        lines.append([("  no active GPU process mapped to this pod", "dim")])
+    lines.append(render.divider(width, unicode))
+    _append_related_procs(lines, related, width, now)
+    return lines
+
+
+def draw_detail(stdscr, curses, attrs, width, height, snapshot, detail, offset,
+                paused=False, unicode=True):
+    lines = detail_lines(snapshot, detail, width, unicode=unicode)
+    visible_rows = max(0, height - 1)
+    offset = clamp_help_offset(offset, len(lines), visible_rows)
+    stdscr.erase()
+    y = 0
+    for line in lines[offset:offset + visible_rows]:
+        if y >= height - 1:
+            break
+        draw_segments(stdscr, curses, y, line, attrs, width)
+        y += 1
+    mode = "PAUSED" if paused else "live"
+    more = ""
+    if offset + visible_rows < len(lines):
+        more = "  +%d more" % (len(lines) - offset - visible_rows)
+    footer = ("Enter/Esc dashboard  j/k scroll  r refresh  p pause:%s  "
+              "? help  q quit%s" % (mode, more))
+    draw_segments(stdscr, curses, height - 1,
+                  [(footer[:width - 1], "dim")], attrs, width)
     stdscr.refresh()
     return offset
 
@@ -1216,6 +1548,58 @@ def run_tui(stdscr, curses, fetcher, view):
         procs = view.visible_procs(shown)
         pods = view.visible_pods(shown)
 
+        if view.screen == "detail":
+            if key != -1:
+                dirty = True
+                if key in (ord("q"), 3):
+                    return
+                elif key in (27,) or is_enter_key(curses, key):
+                    view.close_detail()
+                    continue
+                elif key == ord("t"):
+                    view.screen = "stats"
+                    stats_fetcher.request(statsview.days(), statsview.scope)
+                    continue
+                elif key == ord("?"):
+                    help_open = True
+                    help_offset = 0
+                    help_drawn = False
+                    continue
+                elif key == ord("r"):
+                    fetcher.poke()
+                elif key == ord("p"):
+                    view.paused = not view.paused
+                elif key in (ord("j"), curses.KEY_DOWN):
+                    view.detail_offset += 1
+                elif key in (ord("k"), curses.KEY_UP):
+                    view.detail_offset -= 1
+                elif key == curses.KEY_NPAGE:
+                    view.detail_offset += max(1, height - 2)
+                elif key == curses.KEY_PPAGE:
+                    view.detail_offset -= max(1, height - 2)
+                elif key == ord("g"):
+                    view.detail_offset = 0
+                elif key == ord("G"):
+                    view.detail_offset = len(
+                        detail_lines(shown, view.detail, width,
+                                     unicode=bars_unicode))
+                elif key == curses.KEY_MOUSE:
+                    try:
+                        _, _, _, _, bstate = curses.getmouse()
+                        if bstate & curses.BUTTON4_PRESSED:
+                            view.detail_offset -= 3
+                        elif bstate & curses.BUTTON5_PRESSED:
+                            view.detail_offset += 3
+                    except curses.error:
+                        pass
+            if dirty or key != -1 or (tick and frame % SPIN_FPS == 0):
+                view.detail_offset = draw_detail(
+                    stdscr, curses, attrs, width, height, shown, view.detail,
+                    view.detail_offset, paused=view.paused,
+                    unicode=bars_unicode)
+                dirty = False
+            continue
+
         if key != -1:
             dirty = True
             if key in (ord("q"), 3, 27):
@@ -1224,6 +1608,9 @@ def run_tui(stdscr, curses, fetcher, view):
                 view.screen = "stats"
                 stats_fetcher.request(statsview.days(), statsview.scope)
                 continue
+            elif is_enter_key(curses, key):
+                if view.open_detail(procs, pods):
+                    continue
             elif key == ord("?"):
                 help_open = True
                 help_offset = 0
@@ -1385,7 +1772,14 @@ def run_tui(stdscr, curses, fetcher, view):
                                        and row_index == view.selected["pods"]
                                        and len(pods) > 0))
                 y += 1
-        footer = ("q quit  ? help  t stats  ↑↓ scroll  Tab pane:%s  "
+            if pods_view and len(pod_rows) > pod_start + pods_view:
+                hint = "scroll" if view.focus == "pods" else "Tab+scroll"
+                draw_segments(stdscr, curses, y - 1,
+                              [("... %d more (%s)" %
+                                (len(pod_rows) - pod_start - pods_view + 1,
+                                 hint), "dim")],
+                              attrs, width)
+        footer = ("q quit  ? help  Enter detail  t stats  ↑↓ scroll  Tab pane:%s  "
                   "s sort:%s  o owner:%s  p pause  r refresh"
                   % (view.focus, view.sort, view.owner_filter or "all"))
         draw_segments(stdscr, curses, height - 1,

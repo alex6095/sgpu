@@ -73,5 +73,57 @@ class TestLayoutGutter(unittest.TestCase):
         self.assertTrue(header_text.startswith("  GPU"))
 
 
+class TestDetailLines(unittest.TestCase):
+    def _snap(self):
+        return {
+            "gpus": [{
+                "index": 3, "uuid": "GPU-ty", "name": "NVIDIA H200",
+                "util": 96, "mem_used_mib": 62458,
+                "mem_total_mib": 143771, "temp_c": 68,
+                "power_w": 563, "power_limit_w": 700, "owners": ["ty"],
+            }],
+            "procs": [{
+                "pid": 2621452, "gpu_index": 3, "gpu_uuid": "GPU-ty",
+                "mem_mib": 62458, "owner": "ty", "pod": "ty-lpwm-panda2t",
+                "pod_uid": None, "cmd": "python train_lpwm.py --run-name x",
+                "started_utc": "2026-07-05T02:45:52Z", "sm_util": 96,
+                "attribution": "environ",
+            }],
+            "pods": {"ok": True, "rows": [{
+                "owner": "ty", "pod": "ty-lpwm-panda2t",
+                "node": "h200-04-w-4b11", "phase": "Running",
+                "gpu": 1, "age": "3d16h", "uid": "pod-uid",
+                "start_iso": "2026-07-05T02:45:47Z", "active": 1,
+            }]},
+        }
+
+    def _plain(self, lines):
+        return "\n".join("".join(text for text, _tag in line)
+                         for line in lines)
+
+    def test_process_detail_includes_gpu_pod_and_command(self):
+        ref = {"kind": "proc", "pid": 2621452}
+        text = self._plain(tui.detail_lines(self._snap(), ref, 100))
+        self.assertIn("process pid=2621452", text)
+        self.assertIn("ty-lpwm-panda2t", text)
+        self.assertIn("GPU-ty", text)
+        self.assertIn("python train_lpwm.py", text)
+
+    def test_pod_detail_includes_active_gpu_and_related_proc(self):
+        ref = {"kind": "pod", "pod": "ty-lpwm-panda2t", "uid": "pod-uid"}
+        text = self._plain(tui.detail_lines(self._snap(), ref, 100))
+        self.assertIn("pod ty-lpwm-panda2t", text)
+        self.assertIn("Active GPUs", text)
+        self.assertIn("GPU 3", text)
+        self.assertIn("2621452", text)
+
+    def test_stale_process_uses_last_known_values(self):
+        ref = {"kind": "proc", "pid": 7,
+               "snapshot": {"pid": 7, "owner": "old", "pod": "old-pod"}}
+        text = self._plain(tui.detail_lines({"procs": []}, ref, 80))
+        self.assertIn("stale", text)
+        self.assertIn("old-pod", text)
+
+
 if __name__ == "__main__":
     unittest.main()

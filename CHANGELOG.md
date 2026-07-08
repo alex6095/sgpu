@@ -6,6 +6,22 @@ number so a client never falsely reports itself "behind the server".
 
 ---
 
+## 0.8.11 — Row detail panel, "N more" pods, snappy Esc
+
+- **Enter opens a detail panel** for the selected process or pod: owner, pod,
+  PID, GPU (index/UUID), live SM% / memory / uptime, full command, the GPU's
+  state, the Kubernetes pod fields, and the pod's other GPU processes. It
+  follows the live snapshot; Enter or Esc returns; `j/k`/PgUp/PgDn/wheel
+  scroll. Stale selections show the last known values.
+- The pods pane now shows a **`… N more (Tab+scroll)`** hint when the list is
+  truncated — fixes a case where a pod (e.g. `ty-lpwm-panda2t`) was pushed
+  below the 6-row cap by alphabetically-earlier owners and looked missing (it
+  was collected correctly all along; only the display truncated silently).
+- **Esc is now instant** (ncurses `ESCDELAY` lowered from ~1s), so leaving the
+  help / stats / detail screens no longer lags.
+
+---
+
 ## 0.8.10 — Live clock, index alignment, changelog
 
 - **Live header clock**: the time now ticks every second (a real wall clock)
