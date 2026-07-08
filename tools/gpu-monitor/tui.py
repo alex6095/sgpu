@@ -176,6 +176,34 @@ def bucketize(value, row_max):
     return level
 
 
+# --- spinners --------------------------------------------------------------
+# GPU rows: a braille rotation (fan-like) whose speed tracks util. Braille is
+# single-width, so it never breaks the GPU table's column alignment. The stats
+# "loading" indicator uses a distinct sparkle pulse so the two never look the
+# same; it sits on its own line, so glyph width doesn't matter there.
+
+GPU_SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+GPU_SPIN_ASCII = "|/-\\"
+STATS_SPIN = "✶✳✻✽"
+STATS_SPIN_ASCII = ".oO@"
+_SPIN_K = 220  # util-to-speed divisor; higher = gentler (tuned to feel fan-like)
+
+
+def gpu_spinner_glyph(util, frame, unicode_ok=True):
+    """A spinner glyph for one GPU: static dim '.' when idle, otherwise a
+    braille frame advancing proportionally to util (busy card spins fast)."""
+    frames = GPU_SPIN if unicode_ok else GPU_SPIN_ASCII
+    if util is None or util < 4:
+        return "."
+    idx = (frame * int(util) // _SPIN_K) % len(frames)
+    return frames[idx]
+
+
+def stats_loading_glyph(frame, unicode_ok=True):
+    frames = STATS_SPIN if unicode_ok else STATS_SPIN_ASCII
+    return frames[(frame // 3) % len(frames)]
+
+
 def _version_tuple(text):
     parts = []
     for chunk in str(text).split("."):
@@ -726,7 +754,7 @@ def _stats_columns(mode, merged_owners, daily, window_days, tight):
 
 
 def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
-               width, height):
+               width, height, frame=0):
     """Render the interactive STATS screen. Never raises on odd data."""
     days = statsview.days()
     data, error, fetched_at = stats_fetcher.get(days, statsview.scope)
@@ -735,6 +763,7 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
     stdscr.erase()
     y = 0
     uok = unicode_ok()
+    spin = stats_loading_glyph(frame, uok)
 
     def put(segs):
         nonlocal y
@@ -752,7 +781,7 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
         put([("SGPU stats", "title"),
              ("  axis: %s" % axis_label, "dim")])
         if loading:
-            put([("(loading…)", "dim")])
+            put([("%s loading…" % spin, "warn")])
         elif error:
             put([(error, "warn")])
         else:
@@ -775,7 +804,7 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
               % (window_days, axis_label, scope_label), "title"),
              ("  (age %ds)" % int(age), "dim")]
     if loading:
-        title.append(("  (loading…)", "dim"))
+        title.append(("  %s loading…" % spin, "warn"))
     put(title)
     rule()
 
@@ -1003,7 +1032,7 @@ def draw_help(stdscr, curses, attrs, width, height, offset):
 
 def run_tui(stdscr, curses, fetcher, view):
     curses.curs_set(0)
-    stdscr.timeout(200)
+    stdscr.timeout(100)  # 10 Hz: fine enough for the activity spinners
     try:
         curses.mousemask(curses.BUTTON4_PRESSED | curses.BUTTON5_PRESSED)
     except (curses.error, AttributeError):
@@ -1021,9 +1050,17 @@ def run_tui(stdscr, curses, fetcher, view):
     help_open = False
     help_offset = 0
     help_drawn = False
+    frame = 0
+    last_frame = 0.0
+    FRAME_INTERVAL = 0.1
 
     while True:
         key = stdscr.getch()
+        now = time.time()
+        tick = now - last_frame >= FRAME_INTERVAL
+        if tick:
+            frame += 1
+            last_frame = now
 
         # --- help overlay: renders over whichever screen is active and routes
         # keys to itself, leaving the underlying screen state untouched so
@@ -1135,7 +1172,7 @@ def run_tui(stdscr, curses, fetcher, view):
                         pass
             # Redraw every tick (loading state / age counter advance) or on key.
             draw_stats(stdscr, curses, stats_fetcher, statsview, painter,
-                       attrs, width, height)
+                       attrs, width, height, frame)
             continue
 
         snapshot, error, fetched_at, generation = fetcher.state()
@@ -1219,6 +1256,13 @@ def run_tui(stdscr, curses, fetcher, view):
             elif key == curses.KEY_RESIZE:
                 pass  # size handled above
 
+        # Animate the GPU spinners: redraw on tick while any card is active
+        # and not paused (paused freezes the frame with the data).
+        gpus = shown.get("gpus", [])
+        if tick and not view.paused and any(
+                (g.get("util") or 0) >= 4 for g in gpus):
+            dirty = True
+
         if not dirty:
             continue
         dirty = False
@@ -1226,7 +1270,9 @@ def run_tui(stdscr, curses, fetcher, view):
         filtered = dict(shown, procs=procs)
         banner_segs = update_banner_segments(shown)
         header_lines = render.layout_header(shown, width)
-        gpu_lines = render.layout_gpus(shown, width, bars_unicode)
+        spinners = [(gpu_spinner_glyph(g.get("util"), frame, bars_unicode),
+                     render.util_tag(g.get("util"))) for g in gpus]
+        gpu_lines = render.layout_gpus(shown, width, bars_unicode, spinners)
         free_lines = render.layout_free_summary(shown, width)
         storage_lines = render.layout_storage(shown, width, bars_unicode)
         proc_layout = render.layout_procs(filtered, width)

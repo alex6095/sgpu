@@ -148,7 +148,8 @@ def layout_free_summary(snapshot, width):
     idle = free.get("idle_reserved", 0)
     prefix = "~" if free.get("basis") == "process" else ""
     in_use = max(0, total - count - idle)
-    segs = [("[%s%d/%d free" % (prefix, count, total),
+    segs = [("  ", "plain"),  # align under the GPU-table activity gutter
+            ("[%s%d/%d free" % (prefix, count, total),
              "ok" if count > 0 else "crit")]
     if idle > 0:
         segs.append((" +%d idle" % idle, "warn"))
@@ -157,20 +158,27 @@ def layout_free_summary(snapshot, width):
     return [segs]
 
 
-def layout_gpus(snapshot, width, unicode_ok=True):
+def layout_gpus(snapshot, width, unicode_ok=True, spinners=None):
     bar_w = 10 if width >= 96 else (8 if width >= 80 else 6)
     show_owners = width >= 84
-    # Header is composed with the exact same column widths as the data rows
-    # below (left 14, util span bar_w+9, mem span bar_w+17, "%4s  %9s" tail)
-    # so TEMP/POWER/OWNERS always line up regardless of bar width.
-    header = "%3s %-9s %-*s%-*s%4s  %9s" % (
+    # A 2-char activity gutter leads every row of the hardware block. The TUI
+    # fills it with an animated spinner (spinners[i]); the text report leaves
+    # it static (a dim '*' on active GPUs). The header/free/storage lines get
+    # a matching 2-space indent so the block's left edge stays aligned.
+    # Header is composed with the exact same column widths as the data rows.
+    header = "  %3s %-9s %-*s%-*s%4s  %9s" % (
         "GPU", "NAME", bar_w + 9, "UTIL", bar_w + 17, "MEM", "TEMP", "POWER")
     if show_owners:
         header += "  OWNERS"
     lines = [[(clip(header, width), "header")]]
-    for gpu in snapshot.get("gpus", []):
+    for i, gpu in enumerate(snapshot.get("gpus", [])):
         util = gpu.get("util")
         tag = util_tag(util)
+        if spinners is not None and i < len(spinners):
+            gutter = spinners[i]                      # (glyph, tag) from TUI
+        else:
+            active = util is not None and util >= 4
+            gutter = ("* " if active else "  ", "dim")  # static, text report
         left = "%3s %-9s " % (gpu.get("index", "?"),
                               _short_gpu_name(gpu.get("name")))
         util_text = "[%s] %4s  " % (
@@ -190,7 +198,7 @@ def layout_gpus(snapshot, width, unicode_ok=True):
             ("%dC" % temp) if temp is not None else "?",
             "%s/%sW" % ("%d" % power if power is not None else "?",
                         "%d" % limit if limit is not None else "?"))
-        segments = [(left, tag), (util_text, tag), (mem_text, tag),
+        segments = [gutter, (left, tag), (util_text, tag), (mem_text, tag),
                     (tail, tag)]
         if show_owners:
             owners = gpu.get("owners") or []
@@ -261,6 +269,7 @@ def layout_storage(snapshot, width, unicode_ok=True):
     tag = "crit" if pct >= 95 else ("warn" if pct >= 85 else "ok")
     bar_w = 10 if width >= 96 else 8
     line = _seg_line(
+        ("  ", "plain"),  # align under the GPU-table activity gutter
         ("STORAGE %-11s " % clip(storage.get("label", "?"), 11), "header"),
         ("[%s] %4.1f%%  " % (make_bar(pct, bar_w, unicode_ok), pct), tag),
         ("%s/%s used, %s free" % (fmt_tib(storage.get("used_bytes")),
