@@ -1343,7 +1343,8 @@ def _render_grass(lines, ranked, daily, dates, ow, color, unicode_ok, width):
         lines.append(grass_row(owner, False))
     lines.append(grass_row("TOTAL", True))
 
-    # --- legend ---
+    # --- legend (blank line below the grid so it doesn't blur into it) ---
+    lines.append("")
     if color:
         swatches = "".join(_bg256(GRASS_BG[lv], "  ")
                            for lv in range(len(grass)))

@@ -1,3 +1,3 @@
 """sgpu - simple GPU monitor client for the SGVR lab MLXP cluster."""
 
-__version__ = "0.8.6"
+__version__ = "0.8.7"

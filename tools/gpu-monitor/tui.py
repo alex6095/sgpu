@@ -873,8 +873,9 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
     total_vals = total_series_from_columns(columns)
     draw_grid_row("TOTAL", total_vals, "header")
 
-    # --- legend ---
-    if y < height - 1:
+    # --- legend (blank line below the grid so it doesn't blur into it) ---
+    if y < height - 2:
+        y += 1  # spacer
         draw_segments(stdscr, curses, y, [("less ", "dim")], attrs, width)
         x = len("less ")
         x = draw_cells(stdscr, curses, y, x, [1, 2, 3, 4, 5], painter, width)
