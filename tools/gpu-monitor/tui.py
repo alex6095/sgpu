@@ -186,16 +186,23 @@ GPU_SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 GPU_SPIN_ASCII = "|/-\\"
 STATS_SPIN = "✶✳✻✽"
 STATS_SPIN_ASCII = ".oO@"
-_SPIN_K = 220  # util-to-speed divisor; higher = gentler (tuned to feel fan-like)
+SPIN_FPS = 20                    # animation frames per second
+_FRAME_INTERVAL = 1.0 / SPIN_FPS
+
+
+def _gpu_steps_per_sec(util):
+    """Glyph transitions/sec for a given util: a busy card spins fast, a low-
+    but-active card still visibly turns, an idle card is handled separately."""
+    return min(18.0, max(3.0, util * 0.2))
 
 
 def gpu_spinner_glyph(util, frame, unicode_ok=True):
     """A spinner glyph for one GPU: static dim '.' when idle, otherwise a
-    braille frame advancing proportionally to util (busy card spins fast)."""
+    braille frame advancing at a speed set by util (see _gpu_steps_per_sec)."""
     frames = GPU_SPIN if unicode_ok else GPU_SPIN_ASCII
     if util is None or util < 4:
         return "."
-    idx = (frame * int(util) // _SPIN_K) % len(frames)
+    idx = int(frame * _gpu_steps_per_sec(util) / SPIN_FPS) % len(frames)
     return frames[idx]
 
 
@@ -919,7 +926,7 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
 
 
 def _stats_footer(stdscr, curses, attrs, width, height, statsview):
-    footer = ("t dashboard  a axis:%s  h/d/w/m  n scope:%s  j/k scroll  "
+    footer = ("t dashboard  a axis:%s  h/d/w/m  n scope:%s  ↑↓ scroll  "
               "r refresh  ? help  q quit"
               % (STATS_MODE_LABEL[statsview.mode],
                  "LAB" if statsview.scope == "lab" else "LOCAL"))
@@ -1032,7 +1039,7 @@ def draw_help(stdscr, curses, attrs, width, height, offset):
 
 def run_tui(stdscr, curses, fetcher, view):
     curses.curs_set(0)
-    stdscr.timeout(100)  # 10 Hz: fine enough for the activity spinners
+    stdscr.timeout(int(_FRAME_INTERVAL * 1000))  # ~20 Hz animation clock
     try:
         curses.mousemask(curses.BUTTON4_PRESSED | curses.BUTTON5_PRESSED)
     except (curses.error, AttributeError):
@@ -1052,12 +1059,12 @@ def run_tui(stdscr, curses, fetcher, view):
     help_drawn = False
     frame = 0
     last_frame = 0.0
-    FRAME_INTERVAL = 0.1
+    spin_cells = []  # [(screen_y, util)] of GPU spinner glyphs, for partial redraw
 
     while True:
         key = stdscr.getch()
         now = time.time()
-        tick = now - last_frame >= FRAME_INTERVAL
+        tick = now - last_frame >= _FRAME_INTERVAL
         if tick:
             frame += 1
             last_frame = now
@@ -1108,13 +1115,13 @@ def run_tui(stdscr, curses, fetcher, view):
         # --- STATS screen: independent of the live snapshot ---
         if view.screen == "stats":
             size = stdscr.getmaxyx()
-            if size != last_size:
+            size_changed = size != last_size
+            if size_changed:
                 last_size = size
                 try:
                     curses.resizeterm(*size)
                 except curses.error:
                     pass
-                dirty = True
             height, width = size
             # lazily fetch the current mode's window on entry / mode switch
             stats_fetcher.request(statsview.days(), statsview.scope)
@@ -1170,9 +1177,13 @@ def run_tui(stdscr, curses, fetcher, view):
                             statsview.scroll(3, n_owners, max(1, height - 8))
                     except curses.error:
                         pass
-            # Redraw every tick (loading state / age counter advance) or on key.
-            draw_stats(stdscr, curses, stats_fetcher, statsview, painter,
-                       attrs, width, height, frame)
+            # Redraw on key / resize / while loading (spinner), else a low-rate
+            # tick keeps the age counter live without repainting the whole grid
+            # 20x/sec (which would flood the kubectl-exec stream).
+            loading = stats_fetcher.loading(statsview.days(), statsview.scope)
+            if key != -1 or size_changed or loading or (tick and frame % 5 == 0):
+                draw_stats(stdscr, curses, stats_fetcher, statsview, painter,
+                           attrs, width, height, frame)
             continue
 
         snapshot, error, fetched_at, generation = fetcher.state()
@@ -1256,21 +1267,32 @@ def run_tui(stdscr, curses, fetcher, view):
             elif key == curses.KEY_RESIZE:
                 pass  # size handled above
 
-        # Animate the GPU spinners: redraw on tick while any card is active
-        # and not paused (paused freezes the frame with the data).
         gpus = shown.get("gpus", [])
-        if tick and not view.paused and any(
-                (g.get("util") or 0) >= 4 for g in gpus):
-            dirty = True
+        active = not view.paused and any(
+            (g.get("util") or 0) >= 4 for g in gpus)
 
         if not dirty:
+            # No full redraw needed. Animate the spinners cheaply: repaint only
+            # the ~8 glyph cells in place. This keeps the kubectl-exec stream
+            # quiet (a few bytes/frame instead of a whole screen) and avoids
+            # full-screen erase/redraw churn that could stall it.
+            if tick and active and spin_cells:
+                for cy, cu in spin_cells:
+                    try:
+                        stdscr.addstr(
+                            cy, 0, gpu_spinner_glyph(cu, frame, bars_unicode),
+                            attrs.get(render.util_tag(cu), 0))
+                    except curses.error:
+                        pass
+                stdscr.refresh()
             continue
         dirty = False
 
         filtered = dict(shown, procs=procs)
         banner_segs = update_banner_segments(shown)
         header_lines = render.layout_header(shown, width)
-        spinners = [(gpu_spinner_glyph(g.get("util"), frame, bars_unicode),
+        # 2-char gutter (glyph + space) to match the header's 2-space indent.
+        spinners = [(gpu_spinner_glyph(g.get("util"), frame, bars_unicode) + " ",
                      render.util_tag(g.get("util"))) for g in gpus]
         gpu_lines = render.layout_gpus(shown, width, bars_unicode, spinners)
         free_lines = render.layout_free_summary(shown, width)
@@ -1312,8 +1334,11 @@ def run_tui(stdscr, curses, fetcher, view):
             y += 1
         draw_segments(stdscr, curses, y, div, attrs, width)
         y += 1
-        for line in gpu_lines:
+        spin_cells = []  # record spinner cell positions for partial redraws
+        for j, line in enumerate(gpu_lines):
             draw_segments(stdscr, curses, y, line, attrs, width)
+            if j >= 1 and (j - 1) < len(gpus):  # gpu_lines[0] is the header
+                spin_cells.append((y, gpus[j - 1].get("util")))
             y += 1
         for line in free_lines:
             draw_segments(stdscr, curses, y, line, attrs, width)
@@ -1356,7 +1381,7 @@ def run_tui(stdscr, curses, fetcher, view):
                                        and row_index == view.selected["pods"]
                                        and len(pods) > 0))
                 y += 1
-        footer = ("q quit  ? help  t stats  j/k scroll  Tab pane:%s  "
+        footer = ("q quit  ? help  t stats  ↑↓ scroll  Tab pane:%s  "
                   "s sort:%s  o owner:%s  p pause  r refresh"
                   % (view.focus, view.sort, view.owner_filter or "all"))
         draw_segments(stdscr, curses, height - 1,

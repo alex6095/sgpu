@@ -53,7 +53,7 @@ spec:
       # Public image (Docker Hub) - no pull secret needed, works on any node.
       # Driver 580.126.16 is pinned inside; bump the tag on every change
       # (never repush a tag: IfNotPresent would keep a node's cached layer).
-      image: docker.io/alex6095/sgpu-monitor:0.8.8
+      image: docker.io/alex6095/sgpu-monitor:0.8.9
       imagePullPolicy: IfNotPresent
       securityContext:
         privileged: true
