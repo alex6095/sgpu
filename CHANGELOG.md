@@ -6,6 +6,17 @@ number so a client never falsely reports itself "behind the server".
 
 ---
 
+## 0.8.12 — Pod table fills the screen
+
+- The pods pane now **expands with the terminal height** like the process
+  table: once processes fit, spare height grows the pod list until every pod
+  is visible, instead of stopping at a fixed 6-row cap. The `… N more` hint
+  only appears when the list genuinely doesn't fit. Processes still own the
+  main flexible area, and pods keep a small minimum so they never vanish on a
+  medium screen.
+
+---
+
 ## 0.8.11 — Row detail panel, "N more" pods, snappy Esc
 
 - **Enter opens a detail panel** for the selected process or pod: owner, pod,

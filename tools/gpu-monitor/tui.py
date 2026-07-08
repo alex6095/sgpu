@@ -596,6 +596,31 @@ class StatsView:
         self.offset = max(0, min(max_off, self.offset + delta))
 
 
+def dashboard_row_budget(height, fixed_top, proc_rows, pod_rows,
+                         pod_header_rows, min_height=24, min_pod_rows=3):
+    """Return (proc_view, pods_view, pods_block) for the dashboard.
+
+    The process table owns the main flexible area. Once processes fit, any
+    extra height expands the pod table too, so a tall terminal can show every
+    pod instead of stopping at an arbitrary cap.
+    """
+    variable = max(0, height - fixed_top - 1)  # leave room for footer
+    if height < min_height or pod_rows <= 0:
+        return max(1, variable), 0, 0
+
+    pod_static = 1 + max(0, pod_header_rows)  # divider + pod title/header
+    max_pods_with_one_proc = variable - pod_static - 1
+    if max_pods_with_one_proc <= 0:
+        return max(1, variable), 0, 0
+
+    min_visible_pods = min(pod_rows, min_pod_rows, max_pods_with_one_proc)
+    spare_after_all_procs = variable - max(0, proc_rows) - pod_static
+    pods_view = min(pod_rows, max(min_visible_pods, spare_after_all_procs))
+    pods_block = pod_static + pods_view
+    proc_view = max(1, variable - pods_block)
+    return proc_view, pods_view, pods_block
+
+
 def build_tag_attrs(curses):
     attrs = {"plain": 0}
     if curses.has_colors():
@@ -1699,14 +1724,10 @@ def run_tui(stdscr, curses, fetcher, view):
         fixed_top = (1 if banner_segs else 0) + len(header_lines) + 1 \
             + len(gpu_lines) + len(free_lines) + len(storage_lines) + 1 \
             + len(proc_layout["header"])
-        pods_block = 1 + len(pod_layout["header"]) \
-            + min(len(pod_layout["rows"]), 6)
-        if height < 24:
-            pods_block = 0
-        proc_view = max(1, height - fixed_top - pods_block - 1)
+        proc_view, pods_view, pods_block = dashboard_row_budget(
+            height, fixed_top, len(proc_layout["rows"]),
+            len(pod_layout["rows"]), len(pod_layout["header"]))
         view.clamp("procs", len(procs), proc_view)
-        pods_view = max(0, pods_block - 1 - len(pod_layout["header"])) \
-            if pods_block else 0
         view.clamp("pods", len(pods), max(1, pods_view) if pods_block else 1)
 
         stdscr.erase()

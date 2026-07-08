@@ -125,5 +125,31 @@ class TestDetailLines(unittest.TestCase):
         self.assertIn("old-pod", text)
 
 
+class TestDashboardRowBudget(unittest.TestCase):
+    def test_tall_screen_expands_pods_until_all_visible(self):
+        proc_view, pods_view, pods_block = tui.dashboard_row_budget(
+            height=39, fixed_top=16, proc_rows=10, pod_rows=8,
+            pod_header_rows=2)
+        self.assertGreaterEqual(proc_view, 10)
+        self.assertEqual(pods_view, 8)
+        self.assertEqual(pods_block, 11)
+
+    def test_shorter_screen_keeps_pod_more_state(self):
+        proc_view, pods_view, pods_block = tui.dashboard_row_budget(
+            height=33, fixed_top=16, proc_rows=10, pod_rows=8,
+            pod_header_rows=2)
+        self.assertEqual(proc_view, 10)
+        self.assertEqual(pods_view, 3)
+        self.assertEqual(pods_block, 6)
+
+    def test_very_short_screen_hides_pods(self):
+        proc_view, pods_view, pods_block = tui.dashboard_row_budget(
+            height=23, fixed_top=16, proc_rows=10, pod_rows=8,
+            pod_header_rows=2)
+        self.assertGreaterEqual(proc_view, 1)
+        self.assertEqual(pods_view, 0)
+        self.assertEqual(pods_block, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
