@@ -6,6 +6,16 @@ number so a client never falsely reports itself "behind the server".
 
 ---
 
+## 0.8.17 - TUI startup fix
+
+- Fixed a TUI startup crash in the 0.8.16 owner-color palette registration
+  path (`'list' object has no attribute 'items'`), so plain `sgpu` opens the
+  interactive dashboard again instead of falling back to text output.
+- Added a curses-attribute regression test that exercises the 20 owner-color
+  tags during TUI initialization.
+
+---
+
 ## 0.8.16 - Owner color palette
 
 - Expanded owner colors from 6 slots to a 20-color palette for lab-scale

@@ -163,6 +163,46 @@ class TestOwnerColors(unittest.TestCase):
             self.assertEqual(pod_tags[owner], tags[owner])
 
 
+class TestCursesAttrs(unittest.TestCase):
+    class FakeCurses:
+        COLORS = 256
+        COLOR_GREEN = 2
+        COLOR_YELLOW = 3
+        COLOR_RED = 1
+        COLOR_CYAN = 6
+        COLOR_MAGENTA = 5
+        COLOR_BLUE = 4
+        COLOR_BLACK = 0
+        A_BOLD = 1 << 16
+        A_DIM = 1 << 17
+        error = RuntimeError
+
+        def __init__(self):
+            self.pairs = []
+
+        def has_colors(self):
+            return True
+
+        def start_color(self):
+            pass
+
+        def use_default_colors(self):
+            pass
+
+        def init_pair(self, pair_number, foreground, background):
+            self.pairs.append((pair_number, foreground, background))
+
+        def color_pair(self, pair_number):
+            return pair_number << 8
+
+    def test_build_tag_attrs_registers_all_owner_tags(self):
+        fake = self.FakeCurses()
+        attrs = tui.build_tag_attrs(fake)
+        for i in range(render.OWNER_TAG_COUNT):
+            self.assertIn("o%d" % i, attrs)
+        self.assertGreaterEqual(len(fake.pairs), render.OWNER_TAG_COUNT)
+
+
 class TestLayoutGutter(unittest.TestCase):
     def _snap(self):
         return {"gpus": [{"index": 0, "name": "H200", "util": 90,

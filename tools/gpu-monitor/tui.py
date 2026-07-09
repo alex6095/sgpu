@@ -805,7 +805,7 @@ def build_tag_attrs(curses):
             if getattr(curses, "COLORS", 0) >= 256 else owner_basic
         for i in range(render.OWNER_TAG_COUNT):
             palette.append(("o%d" % i, owner_colors[i % len(owner_colors)]))
-        for pair_number, (tag, color) in enumerate(palette.items(), start=1):
+        for pair_number, (tag, color) in enumerate(palette, start=1):
             try:
                 curses.init_pair(pair_number, color, background)
                 attrs[tag] = curses.color_pair(pair_number)
