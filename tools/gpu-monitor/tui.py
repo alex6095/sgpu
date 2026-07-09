@@ -55,7 +55,8 @@ STATS_MODE_LABEL = {"hours": "HOURS", "days": "DAYS",
 # GitHub-contribution green scale (256-color xterm indices), zero-bucket first.
 GRID_COLORS = (237, 22, 28, 34, 40, 46)  # index 0 == empty cell, 1..5 hotter
 # curses color-pair numbers for the grid; start well past build_tag_attrs()'s
-# pairs (it registers ~12) so we never collide. Registered lazily, once.
+# pairs (base styles + 20 owner tags) so we never collide. Registered lazily,
+# once.
 GRID_PAIR_BASE = 40
 
 # Two-char cell ramps (index 0..5). Unicode preferred, ASCII fallback.
@@ -790,14 +791,20 @@ def build_tag_attrs(curses):
             background = -1
         except curses.error:
             background = curses.COLOR_BLACK
-        palette = {
+        base_palette = {
             "ok": curses.COLOR_GREEN, "warn": curses.COLOR_YELLOW,
             "crit": curses.COLOR_RED, "title": curses.COLOR_CYAN,
             "section": curses.COLOR_MAGENTA,
-            "o0": curses.COLOR_CYAN, "o1": curses.COLOR_GREEN,
-            "o2": curses.COLOR_YELLOW, "o3": curses.COLOR_MAGENTA,
-            "o4": curses.COLOR_BLUE, "o5": curses.COLOR_RED,
         }
+        owner_basic = (
+            curses.COLOR_CYAN, curses.COLOR_GREEN, curses.COLOR_YELLOW,
+            curses.COLOR_MAGENTA, curses.COLOR_BLUE, curses.COLOR_RED,
+        )
+        palette = list(base_palette.items())
+        owner_colors = render.OWNER_256_COLORS \
+            if getattr(curses, "COLORS", 0) >= 256 else owner_basic
+        for i in range(render.OWNER_TAG_COUNT):
+            palette.append(("o%d" % i, owner_colors[i % len(owner_colors)]))
         for pair_number, (tag, color) in enumerate(palette.items(), start=1):
             try:
                 curses.init_pair(pair_number, color, background)
@@ -806,7 +813,8 @@ def build_tag_attrs(curses):
                 attrs[tag] = 0
         attrs["title"] |= curses.A_BOLD
         attrs["section"] |= curses.A_BOLD
-        for tag in ("o0", "o1", "o2", "o3", "o4", "o5"):
+        for i in range(render.OWNER_TAG_COUNT):
+            tag = "o%d" % i
             attrs[tag] |= curses.A_BOLD
     attrs["header"] = curses.A_BOLD
     attrs["rule"] = curses.A_DIM
@@ -923,7 +931,7 @@ def _owner_node_label(owner, owner_nodes):
     return label if best >= 0.95 * total else "both"
 
 
-def _leaderboard_rows(owners, width, owner_nodes=None):
+def _leaderboard_rows(owners, width, owner_nodes=None, owner_tags=None):
     """Build (header_segments, [row_segments]) for the leaderboard.
 
     Columns: OWNER (colored) [NODE in lab scope] GPU-H EFF-H AVG-SM%
@@ -962,7 +970,7 @@ def _leaderboard_rows(owners, width, owner_nodes=None):
             if owner_nodes is not None else ""
         rows.append([
             ("%-3s " % ("%d." % rank), "dim"),
-            (name, render.owner_tag(owner)),
+            (name, render.owner_tag(owner, owner_tags)),
             ("%s %7s %7s %8s %9s"
              % (node_val, "%.1f" % gpu_h, eff_s, sm_s, peak_s), "plain"),
         ])
@@ -1028,6 +1036,8 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
     awards = data.get("awards") or []
     owner_nodes = data.get("owner_nodes") if data.get("scope") == "lab" \
         else None
+    owner_tags = render.owner_tag_map(
+        list(owners.keys()) + [aw.get("owner") for aw in awards])
 
     age = time.time() - fetched_at if fetched_at else 0.0
     scope_label = "LAB" if statsview.scope == "lab" \
@@ -1049,13 +1059,14 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
             seg = [("%s " % icon, "plain"),
                    ("%s " % (aw.get("title") or ""), "header"),
                    ("%s" % (aw.get("owner") or ""),
-                    render.owner_tag(aw.get("owner"))),
+                    render.owner_tag(aw.get("owner"), owner_tags)),
                    ("  %s" % (aw.get("detail") or ""), "dim")]
             put(seg)
         rule()
 
     # --- leaderboard (rows drop before the grid when space is tight) ---
-    lb_header, lb_rows = _leaderboard_rows(owners, width, owner_nodes)
+    lb_header, lb_rows = _leaderboard_rows(owners, width, owner_nodes,
+                                           owner_tags)
     show_leaderboard = height >= 12
     if show_leaderboard:
         put([("Leaderboard", "section")])
@@ -1122,7 +1133,7 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
 
     for owner in visible_owner_names:
         vals = owner_series_from_columns(columns, owner)
-        draw_grid_row(owner, vals, render.owner_tag(owner))
+        draw_grid_row(owner, vals, render.owner_tag(owner, owner_tags))
 
     if start + rows_avail < total_owner_rows and y < height - 1:
         draw_segments(stdscr, curses, y,
@@ -1418,10 +1429,12 @@ def _append_wrapped(lines, label, value, tag="plain", width=120):
         lines.append([(indent, "plain"), (chunk, tag)])
 
 
-def _append_pod_fields(lines, pod, width):
+def _append_pod_fields(lines, pod, width, owner_tags=None):
     owner = pod.get("owner") or "?"
-    _append_kv(lines, "Owner", owner, render.owner_tag(owner), width)
-    _append_kv(lines, "Pod", pod.get("pod"), render.owner_tag(owner), width)
+    _append_kv(lines, "Owner", owner, render.owner_tag(owner, owner_tags),
+               width)
+    _append_kv(lines, "Pod", pod.get("pod"),
+               render.owner_tag(owner, owner_tags), width)
     _append_kv(lines, "Phase", pod.get("phase"), "plain", width)
     _append_kv(lines, "Request", pod.get("gpu"), "plain", width)
     _append_kv(lines, "Active", pod.get("active", 0), "plain", width)
@@ -1482,13 +1495,18 @@ def _append_related_procs(lines, procs, width, now):
             lines.append([(render.clip(indent + chunk, width), tag)])
 
 
-def detail_lines(snapshot, detail, width, now=None, unicode=True):
+def detail_lines(snapshot, detail, width, now=None, unicode=True,
+                 owner_tags=None):
     """Build scrollable detail-screen lines for a selected process or pod."""
     now = now or time.time()
     lines = []
     if not detail:
         return [[("SGPU detail", "title")],
                 [("  no selected row", "warn")]]
+    if owner_tags is None:
+        owner_tags = render.owner_tag_map(
+            render.snapshot_owners(snapshot) +
+            [((detail.get("snapshot") or {}).get("owner"))])
 
     kind = detail.get("kind")
     if kind == "proc":
@@ -1504,9 +1522,10 @@ def detail_lines(snapshot, detail, width, now=None, unicode=True):
             lines.append([("  selected process is no longer visible; "
                            "showing last known values", "warn")])
         lines.append([("Process", "section")])
-        _append_kv(lines, "Owner", owner, render.owner_tag(owner), width)
-        _append_kv(lines, "Pod", proc.get("pod"), render.owner_tag(owner),
+        _append_kv(lines, "Owner", owner, render.owner_tag(owner, owner_tags),
                    width)
+        _append_kv(lines, "Pod", proc.get("pod"),
+                   render.owner_tag(owner, owner_tags), width)
         _append_kv(lines, "PID", proc.get("pid"), "plain", width)
         _append_kv(lines, "GPU", _gpu_label(proc), "plain", width)
         _append_kv(lines, "SM", _pct(proc.get("sm_util")),
@@ -1529,7 +1548,7 @@ def detail_lines(snapshot, detail, width, now=None, unicode=True):
             if not pod_live:
                 lines.append([("  matching pod row is not in current pod view",
                                "warn")])
-            _append_pod_fields(lines, pod, width)
+            _append_pod_fields(lines, pod, width, owner_tags)
         else:
             lines.append([("  no matching GPU-requesting pod row", "warn")])
         lines.append(render.divider(width, unicode))
@@ -1547,7 +1566,7 @@ def detail_lines(snapshot, detail, width, now=None, unicode=True):
         lines.append([("  selected pod is no longer visible; showing last "
                        "known values", "warn")])
     lines.append([("Kubernetes pod", "section")])
-    _append_pod_fields(lines, pod, width)
+    _append_pod_fields(lines, pod, width, owner_tags)
     related = _related_procs(snapshot, pod.get("pod"))
     active_gpus = []
     seen = set()
@@ -1945,17 +1964,23 @@ def run_tui(stdscr, curses, fetcher, view):
         dirty = False
 
         filtered = dict(shown, procs=procs)
+        pods_snapshot = dict(shown, pods=dict(
+            shown.get("pods") or {}, rows=pods))
+        owner_tags = render.owner_tag_map(render.snapshot_owners(
+            dict(filtered, pods=pods_snapshot.get("pods"))))
         banner_segs = update_banner_segments(shown)
         header_lines = render.layout_header(shown, width, live=True)
         # 2-char gutter (glyph + space) to match the header's 2-space indent.
         spinners = [(gpu_spinner_glyph(g.get("util"), frame, bars_unicode) + " ",
                      render.util_tag(g.get("util"))) for g in gpus]
-        gpu_lines = render.layout_gpus(shown, width, bars_unicode, spinners)
+        gpu_lines = render.layout_gpus(shown, width, bars_unicode, spinners,
+                                       owner_tags=owner_tags)
         free_lines = render.layout_free_summary(shown, width)
         storage_lines = render.layout_storage(shown, width, bars_unicode)
-        proc_layout = render.layout_procs(filtered, width)
-        pod_layout = render.layout_pods(dict(shown, pods=dict(
-            shown.get("pods") or {}, rows=pods)), width)
+        proc_layout = render.layout_procs(filtered, width,
+                                          owner_tags=owner_tags)
+        pod_layout = render.layout_pods(pods_snapshot, width,
+                                        owner_tags=owner_tags)
         div = render.divider(width, bars_unicode)
 
         # Vertical budget: [banner] + header + divider + gpus + free + storage

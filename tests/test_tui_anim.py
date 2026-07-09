@@ -99,6 +99,70 @@ class TestNonblockingInputPacing(unittest.TestCase):
             10.0 + tui._FRAME_INTERVAL, 10.0), 0.0)
 
 
+class TestOwnerColors(unittest.TestCase):
+    LAB_NAMES = [
+        "sangmin", "taegun", "ty", "yoonki", "kbhan",
+        "alex", "junho", "minji", "seung", "hyun",
+        "jiyoon", "jaewon", "donghyun", "young", "jisoo",
+        "hyejin", "taeho", "minsu", "jiho", "soyeon",
+    ]
+
+    def test_palette_exposes_twenty_owner_tags(self):
+        owner_keys = [k for k in render.ANSI if k.startswith("o")
+                      and k[1:].isdigit()]
+        self.assertEqual(render.OWNER_TAG_COUNT, 20)
+        self.assertEqual(len(owner_keys), 20)
+
+    def test_visible_owner_map_avoids_current_screen_collisions(self):
+        tags = render.owner_tag_map(self.LAB_NAMES)
+        self.assertNotEqual(tags["sangmin"], tags["taegun"])
+        self.assertEqual(len(set(tags.values())), len(self.LAB_NAMES))
+
+    def test_visible_owner_map_is_order_independent(self):
+        forward = render.owner_tag_map(self.LAB_NAMES)
+        reverse = render.owner_tag_map(list(reversed(self.LAB_NAMES)))
+        self.assertEqual(forward, reverse)
+
+    def test_dashboard_layouts_share_owner_map(self):
+        snap = {
+            "gpus": [{
+                "index": 0, "name": "H200", "util": 98,
+                "mem_used_mib": 1000, "mem_total_mib": 143771,
+                "temp_c": 60, "power_w": 500, "power_limit_w": 700,
+                "owners": ["sangmin", "taegun"],
+            }],
+            "procs": [
+                {"gpu_index": 0, "owner": "sangmin", "pod": "sangmin-a",
+                 "pid": 1, "sm_util": 98, "mem_mib": 1000},
+                {"gpu_index": 0, "owner": "taegun", "pod": "taegun-b",
+                 "pid": 2, "sm_util": 97, "mem_mib": 1000},
+            ],
+            "pods": {"ok": True, "rows": [
+                {"owner": "sangmin", "pod": "sangmin-a", "gpu": 1,
+                 "active": 1, "age": "1m", "phase": "Running"},
+                {"owner": "taegun", "pod": "taegun-b", "gpu": 1,
+                 "active": 1, "age": "1m", "phase": "Running"},
+            ]},
+        }
+        tags = render.owner_tag_map(render.snapshot_owners(snap))
+        gpu_line = render.layout_gpus(
+            snap, 120, True, owner_tags=tags)[1]
+        procs = render.layout_procs(
+            snap, 120, owner_tags=tags)["rows"]
+        pods = render.layout_pods(
+            snap, 120, owner_tags=tags)["rows"]
+
+        gpu_tags = {text: tag for text, tag in gpu_line
+                    if text in ("sangmin", "taegun")}
+        proc_tags = {row[1][0].strip(): row[1][1] for row in procs}
+        pod_tags = {row[0][0].strip(): row[0][1] for row in pods}
+
+        for owner in ("sangmin", "taegun"):
+            self.assertEqual(gpu_tags[owner], tags[owner])
+            self.assertEqual(proc_tags[owner], tags[owner])
+            self.assertEqual(pod_tags[owner], tags[owner])
+
+
 class TestLayoutGutter(unittest.TestCase):
     def _snap(self):
         return {"gpus": [{"index": 0, "name": "H200", "util": 90,

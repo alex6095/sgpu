@@ -6,6 +6,18 @@ number so a client never falsely reports itself "behind the server".
 
 ---
 
+## 0.8.16 - Owner color palette
+
+- Expanded owner colors from 6 slots to a 20-color palette for lab-scale
+  dashboards.
+- Added per-screen owner color assignment so visible owners avoid collisions
+  when the palette has room, while keeping the mapping deterministic for the
+  same owner set.
+- Applied the shared owner color map across the dashboard, stats screen,
+  detail screen, and text renderers so owner names stay visually consistent.
+
+---
+
 ## 0.8.15 — Agent JSON and nonblocking TUI input
 
 - Added stable agent-oriented JSON output with `agent_schema: 1` via

@@ -5,7 +5,7 @@ Two backends consume them: render_text() maps tags to ANSI SGR codes for
 /table and /apps, and tui.py maps the same tags to curses color pairs.
 Thresholds, bars, column widths and owner colors live here and only here.
 
-Tags: title section header rule ok warn crit dim plain o0..o5
+Tags: title section header rule ok warn crit dim plain o0..o19
 """
 
 import time
@@ -23,24 +23,70 @@ ANSI = {
     "crit": "\x1b[31m",
     "dim": "\x1b[2m",
     "plain": "",
-    "o0": "\x1b[96m",
-    "o1": "\x1b[92m",
-    "o2": "\x1b[93m",
-    "o3": "\x1b[95m",
-    "o4": "\x1b[94m",
-    "o5": "\x1b[91m",
 }
 RESET = "\x1b[0m"
-OWNER_TAG_COUNT = 6
+OWNER_256_COLORS = (
+    51, 82, 226, 213, 39, 208, 147, 118, 205, 220,
+    87, 183, 154, 203, 111, 219, 190, 75, 214, 201,
+)
+OWNER_TAG_COUNT = len(OWNER_256_COLORS)
+for _i, _color in enumerate(OWNER_256_COLORS):
+    ANSI["o%d" % _i] = "\x1b[1;38;5;%dm" % _color
 
 
-def owner_tag(owner):
+def _owner_hash(owner):
+    code = 0
+    for ch in str(owner):  # multiplicative hash: plain ord-sums collide often
+        code = (code * 31 + ord(ch)) % 100003
+    return code
+
+
+def owner_tag(owner, owner_tags=None):
     if not owner or owner == "?":
         return "dim"
-    code = 0
-    for ch in owner:  # multiplicative hash: plain ord-sums collide often
-        code = (code * 31 + ord(ch)) % 100003
-    return "o%d" % (code % OWNER_TAG_COUNT)
+    owner = str(owner)
+    if owner_tags and owner in owner_tags:
+        return owner_tags[owner]
+    return "o%d" % (_owner_hash(owner) % OWNER_TAG_COUNT)
+
+
+def owner_tag_map(owners):
+    """Assign visible owners distinct tags when the 20-color palette allows."""
+    unique = []
+    seen = set()
+    for owner in owners or []:
+        if not owner or owner == "?":
+            continue
+        owner = str(owner)
+        if owner in seen:
+            continue
+        seen.add(owner)
+        unique.append(owner)
+
+    out = {}
+    used = set()
+    for owner in sorted(unique, key=lambda value: (value.lower(), value)):
+        preferred = _owner_hash(owner) % OWNER_TAG_COUNT
+        slot = preferred
+        if len(used) < OWNER_TAG_COUNT:
+            for _ in range(OWNER_TAG_COUNT):
+                if slot not in used:
+                    break
+                slot = (slot + 1) % OWNER_TAG_COUNT
+            used.add(slot)
+        out[owner] = "o%d" % slot
+    return out
+
+
+def snapshot_owners(snapshot):
+    owners = []
+    for gpu in snapshot.get("gpus", []) or []:
+        owners.extend(gpu.get("owners") or [])
+    for proc in snapshot.get("procs", []) or []:
+        owners.append(proc.get("owner"))
+    for row in ((snapshot.get("pods") or {}).get("rows") or []):
+        owners.append(row.get("owner"))
+    return owners
 
 
 def util_tag(util):
@@ -165,7 +211,8 @@ def layout_free_summary(snapshot, width):
     return [segs]
 
 
-def layout_gpus(snapshot, width, unicode_ok=True, spinners=None):
+def layout_gpus(snapshot, width, unicode_ok=True, spinners=None,
+                owner_tags=None):
     bar_w = 10 if width >= 96 else (8 if width >= 80 else 6)
     show_owners = width >= 84
     # A 2-char activity gutter leads every row of the hardware block. The TUI
@@ -215,7 +262,7 @@ def layout_gpus(snapshot, width, unicode_ok=True, spinners=None):
                 for pos, owner in enumerate(owners):
                     if pos:
                         segments.append((",", "plain"))
-                    segments.append((owner, owner_tag(owner)))
+                    segments.append((owner, owner_tag(owner, owner_tags)))
             else:
                 segments.append(("-", "dim"))
         lines.append(segments)
@@ -233,7 +280,7 @@ def proc_columns(width):
     return pod_w, cmd_w
 
 
-def layout_procs(snapshot, width, now=None):
+def layout_procs(snapshot, width, now=None, owner_tags=None):
     """Returns {"header": [...], "rows": [...]} so the TUI can scroll rows."""
     pod_w, cmd_w = proc_columns(width)
     title = [(clip("NVIDIA compute processes", width), "section")]
@@ -248,9 +295,9 @@ def layout_procs(snapshot, width, now=None):
             ("%3s  " % (proc.get("gpu_index")
                         if proc.get("gpu_index") is not None else "?"),
              "plain"),
-            (pad(owner, 8), owner_tag(proc.get("owner"))),
+            (pad(owner, 8), owner_tag(proc.get("owner"), owner_tags)),
             ("  %s  " % pad(proc.get("pod") or "?", pod_w),
-             owner_tag(proc.get("owner"))),
+             owner_tag(proc.get("owner"), owner_tags)),
             ("%7s  " % proc.get("pid", "?"), "plain"),
             ("%4s  " % (("%d" % sm) if sm is not None else "-"),
              util_tag(sm) if sm is not None else "dim"),
@@ -287,7 +334,7 @@ def layout_storage(snapshot, width, unicode_ok=True):
     return [line]
 
 
-def layout_pods(snapshot, width):
+def layout_pods(snapshot, width, owner_tags=None):
     pods = snapshot.get("pods") or {}
     title = [(clip("Kubernetes GPU pods on this node", width), "section")]
     if not pods.get("ok"):
@@ -300,9 +347,10 @@ def layout_pods(snapshot, width):
     rows = []
     for row in pods.get("rows", []):
         idle = row.get("phase") == "Running" and row.get("active", 0) == 0
-        pod_tag = "warn" if idle else owner_tag(row.get("owner"))
+        pod_tag = "warn" if idle else owner_tag(row.get("owner"), owner_tags)
         rows.append(_seg_line(
-            (pad(row.get("owner") or "?", 8), owner_tag(row.get("owner"))),
+            (pad(row.get("owner") or "?", 8),
+             owner_tag(row.get("owner"), owner_tags)),
             ("  %3s  %3s  %-7s  %-8s  " % (
                 row.get("gpu", "?"), row.get("active", 0),
                 row.get("age", "?"), row.get("phase", "?")), "plain"),
@@ -329,18 +377,20 @@ def paint(segments, color):
 
 def render_text(snapshot, width=120, color=False, unicode_ok=True,
                 footer_notes=()):
+    owner_tags = owner_tag_map(snapshot_owners(snapshot))
     lines = []
     lines.extend(layout_header(snapshot, width))
     lines.append(divider(width, unicode_ok))
-    lines.extend(layout_gpus(snapshot, width, unicode_ok))
+    lines.extend(layout_gpus(snapshot, width, unicode_ok,
+                             owner_tags=owner_tags))
     lines.extend(layout_free_summary(snapshot, width))
     lines.extend(layout_storage(snapshot, width, unicode_ok))
     lines.append(divider(width, unicode_ok))
-    procs = layout_procs(snapshot, width)
+    procs = layout_procs(snapshot, width, owner_tags=owner_tags)
     lines.extend(procs["header"])
     lines.extend(procs["rows"])
     lines.append(divider(width, unicode_ok))
-    pods = layout_pods(snapshot, width)
+    pods = layout_pods(snapshot, width, owner_tags=owner_tags)
     lines.extend(pods["header"])
     lines.extend(pods["rows"])
     for note in footer_notes:
@@ -349,6 +399,7 @@ def render_text(snapshot, width=120, color=False, unicode_ok=True,
 
 
 def render_procs_text(snapshot, width=120, color=False):
-    procs = layout_procs(snapshot, width)
+    owner_tags = owner_tag_map(snapshot_owners(snapshot))
+    procs = layout_procs(snapshot, width, owner_tags=owner_tags)
     lines = procs["header"] + procs["rows"]
     return "\n".join(paint(line, color) for line in lines) + "\n"
