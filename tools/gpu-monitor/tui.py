@@ -14,6 +14,7 @@ backend through render.py style tags.
 import json
 import locale
 import os
+import select
 import sys
 import textwrap
 import threading
@@ -304,6 +305,160 @@ def set_nonblocking_input(stdscr):
             stdscr.timeout(0)
         except Exception:
             pass
+
+
+def poll_key(stdscr, input_fd=0, select_fn=select.select):
+    """Read a key only when the tty says input is ready.
+
+    nodelay() is still enabled, but kubectl-exec PTYs have occasionally lost
+    that curses window flag after long sessions.  The zero-timeout select is
+    an independent guard that prevents a surprise blocking read.
+    """
+    try:
+        readable, _writable, _exceptional = select_fn(
+            [input_fd], [], [], 0)
+    except (OSError, ValueError):
+        # nodelay remains the fallback on platforms where select cannot poll
+        # the tty descriptor.
+        return stdscr.getch()
+    if not readable:
+        return -1
+    return stdscr.getch()
+
+
+class CursesOutputBuffer:
+    """Capture each curses frame before forwarding it to the real PTY.
+
+    ncurses' C stdio path can spin inside fflush() when a nonblocking PTY is
+    full, so setting O_NONBLOCK on stdout is not enough.  Redirecting ncurses
+    to an always-drained pipe makes refresh() bounded.  Completed bytes are
+    then forwarded nonblockingly to the original terminal; an unsent suffix
+    is retained so escape sequences are never truncated.
+    """
+
+    def __init__(self, stream=None):
+        stream = sys.stdout if stream is None else stream
+        self.output_fd = stream.fileno()
+        self.real_fd = os.dup(self.output_fd)
+        self.was_blocking = os.get_blocking(self.real_fd)
+        self.read_fd, write_fd = os.pipe()
+        self.pending = b""
+        self.broken = False
+        self.closed = False
+        try:
+            os.set_blocking(self.real_fd, False)
+            os.set_blocking(self.read_fd, False)
+            os.dup2(write_fd, self.output_fd)
+        except (AttributeError, OSError, ValueError):
+            try:
+                os.set_blocking(self.output_fd, self.was_blocking)
+            except (AttributeError, OSError, ValueError):
+                pass
+            os.close(self.read_fd)
+            os.close(self.real_fd)
+            raise
+        finally:
+            os.close(write_fd)
+
+    def take_frame(self):
+        chunks = []
+        while True:
+            try:
+                chunk = os.read(self.read_fd, 65536)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    def flush_pending(self):
+        if self.broken:
+            return False
+        while self.pending:
+            try:
+                written = os.write(self.real_fd, self.pending)
+            except BlockingIOError:
+                return False
+            except OSError:
+                self.broken = True
+                return False
+            if written <= 0:
+                return False
+            self.pending = self.pending[written:]
+        return True
+
+    def send_frame(self, frame):
+        if self.pending or self.broken:
+            return False
+        self.pending = frame
+        return self.flush_pending()
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        tail = self.take_frame()
+        if tail:
+            self.pending += tail
+        self.flush_pending()  # best effort; never wait for a wedged consumer
+        try:
+            os.dup2(self.real_fd, self.output_fd)
+            os.set_blocking(self.output_fd, self.was_blocking)
+        finally:
+            os.close(self.read_fd)
+            os.close(self.real_fd)
+
+
+class RefreshController:
+    """Nonblocking curses refresh with bounded retry backoff.
+
+    A kubectl-exec stream can temporarily stop draining its PTY.  ncurses
+    writes into CursesOutputBuffer's local pipe while this controller forwards
+    completed bytes to the real PTY without blocking.  It retains any unsent
+    suffix and forces a later full repaint after the stream recovers.
+    """
+
+    def __init__(self, clock=time.monotonic, min_backoff=0.05,
+                 max_backoff=1.0, output=None):
+        self.clock = clock
+        self.min_backoff = min_backoff
+        self.max_backoff = max_backoff
+        self.output = output
+        self.failures = 0
+        self.retry_at = 0.0
+
+    def _failed(self, stdscr, curses, now):
+        self.failures += 1
+        exponent = min(self.failures - 1, 20)
+        delay = min(self.max_backoff,
+                    self.min_backoff * (2 ** exponent))
+        self.retry_at = now + delay
+        try:
+            stdscr.touchwin()
+        except (curses.error, AttributeError):
+            pass
+        return False
+
+    def refresh(self, stdscr, curses):
+        now = self.clock()
+        if now < self.retry_at:
+            return False
+        if self.output is not None and not self.output.flush_pending():
+            return self._failed(stdscr, curses, now)
+        try:
+            stdscr.refresh()
+        except (curses.error, OSError):
+            if self.output is not None:
+                self.output.take_frame()
+            return self._failed(stdscr, curses, now)
+        if self.output is not None:
+            frame = self.output.take_frame()
+            if not self.output.send_frame(frame):
+                return self._failed(stdscr, curses, now)
+        self.failures = 0
+        self.retry_at = 0.0
+        return True
 
 
 def _version_tuple(text):
@@ -992,7 +1147,7 @@ def _stats_columns(mode, merged_owners, daily, window_days, tight):
 
 
 def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
-               width, height, frame=0):
+               refresher, width, height, frame=0):
     """Render the interactive STATS screen. Never raises on odd data."""
     days = statsview.days()
     data, error, fetched_at = stats_fetcher.get(days, statsview.scope)
@@ -1026,8 +1181,7 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
         else:
             put([("(no stats yet)", "dim")])
         _stats_footer(stdscr, curses, attrs, width, height, statsview)
-        stdscr.refresh()
-        return
+        return refresher.refresh(stdscr, curses)
 
     merged = data.get("merged") or {}
     owners = merged.get("owners") or {}
@@ -1158,7 +1312,7 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
         y += 1
 
     _stats_footer(stdscr, curses, attrs, width, height, statsview)
-    stdscr.refresh()
+    return refresher.refresh(stdscr, curses)
 
 
 def _stats_footer(stdscr, curses, attrs, width, height, statsview):
@@ -1293,8 +1447,8 @@ def clamp_help_offset(offset, line_count, visible_rows):
     return offset
 
 
-def draw_help(stdscr, curses, attrs, width, height, offset):
-    """Render the scrollable help overlay. Returns the clamped offset used.
+def draw_help(stdscr, curses, attrs, refresher, width, height, offset):
+    """Render help; return (clamped offset, whether refresh completed).
 
     Draws `help_lines()` starting at row 0, skipping `offset` lines. Each line
     may be a single (text, tag) tuple or a list of segments; both are handed to
@@ -1313,8 +1467,8 @@ def draw_help(stdscr, curses, attrs, width, height, offset):
         segs = line if isinstance(line, list) else [line]
         draw_segments(stdscr, curses, y, segs, attrs, width)
         y += 1
-    stdscr.refresh()
-    return offset
+    rendered = refresher.refresh(stdscr, curses)
+    return offset, rendered
 
 
 def is_enter_key(curses, key):
@@ -1598,8 +1752,8 @@ def detail_lines(snapshot, detail, width, now=None, unicode=True,
     return lines
 
 
-def draw_detail(stdscr, curses, attrs, width, height, snapshot, detail, offset,
-                paused=False, unicode=True):
+def draw_detail(stdscr, curses, attrs, refresher, width, height, snapshot,
+                detail, offset, paused=False, unicode=True):
     lines = detail_lines(snapshot, detail, width, unicode=unicode)
     visible_rows = max(0, height - 1)
     offset = clamp_help_offset(offset, len(lines), visible_rows)
@@ -1626,11 +1780,11 @@ def draw_detail(stdscr, curses, attrs, width, height, snapshot, detail, offset,
     ], width)
     draw_segments(stdscr, curses, height - 1,
                   [(footer, "dim")], attrs, width)
-    stdscr.refresh()
-    return offset
+    rendered = refresher.refresh(stdscr, curses)
+    return offset, rendered
 
 
-def run_tui(stdscr, curses, fetcher, view):
+def run_tui(stdscr, curses, fetcher, view, output=None):
     curses.curs_set(0)
     # Never rely on curses' timeout mode for liveness. In long kubectl exec
     # sessions we have observed getch() fall back to a blocking tty read, while
@@ -1644,6 +1798,7 @@ def run_tui(stdscr, curses, fetcher, view):
     attrs = build_tag_attrs(curses)
     bars_unicode = unicode_ok()
     painter = GridPainter(curses, bars_unicode)
+    refresher = RefreshController(output=output)
     stats_fetcher = StatsFetcher(fetcher.stats_urls())
     stats_fetcher.start()
     statsview = StatsView(fetcher.node_labels(current_first=True))
@@ -1659,7 +1814,7 @@ def run_tui(stdscr, curses, fetcher, view):
     spin_cells = []  # [(screen_y, util)] of GPU spinner glyphs, for partial redraw
 
     while True:
-        key = stdscr.getch()
+        key = poll_key(stdscr)
         now = time.time()
         if key == -1:
             sleep_for = frame_sleep_seconds(now, last_frame)
@@ -1710,9 +1865,9 @@ def run_tui(stdscr, curses, fetcher, view):
             # The help text is static; only repaint on open/scroll/resize so
             # the per-tick loop doesn't clear() the screen and flicker.
             if not help_drawn:
-                help_offset = draw_help(stdscr, curses, attrs, width, height,
-                                        help_offset)
-                help_drawn = True
+                help_offset, help_drawn = draw_help(
+                    stdscr, curses, attrs, refresher, width, height,
+                    help_offset)
             continue
 
         # --- STATS screen: independent of the live snapshot ---
@@ -1788,7 +1943,7 @@ def run_tui(stdscr, curses, fetcher, view):
             loading = stats_fetcher.loading(statsview.days(), statsview.scope)
             if key != -1 or size_changed or loading or (tick and frame % 5 == 0):
                 draw_stats(stdscr, curses, stats_fetcher, statsview, painter,
-                           attrs, width, height, frame)
+                           attrs, refresher, width, height, frame)
             continue
 
         snapshot, error, fetched_at, generation, target_label = fetcher.state()
@@ -1797,7 +1952,7 @@ def run_tui(stdscr, curses, fetcher, view):
             draw_segments(stdscr, curses, 0,
                           [(error or "connecting to sgpu server...", "warn")],
                           attrs, last_size[1])
-            stdscr.refresh()
+            refresher.refresh(stdscr, curses)
             if key in (ord("q"), 3):
                 return
             continue
@@ -1868,11 +2023,11 @@ def run_tui(stdscr, curses, fetcher, view):
                     except curses.error:
                         pass
             if dirty or key != -1 or (tick and frame % SPIN_FPS == 0):
-                view.detail_offset = draw_detail(
-                    stdscr, curses, attrs, width, height, shown, view.detail,
-                    view.detail_offset, paused=view.paused,
+                view.detail_offset, rendered = draw_detail(
+                    stdscr, curses, attrs, refresher, width, height, shown,
+                    view.detail, view.detail_offset, paused=view.paused,
                     unicode=bars_unicode)
-                dirty = False
+                dirty = not rendered
             continue
 
         if key != -1:
@@ -1959,7 +2114,8 @@ def run_tui(stdscr, curses, fetcher, view):
                             attrs.get(render.util_tag(cu), 0))
                     except curses.error:
                         pass
-                stdscr.refresh()
+                if not refresher.refresh(stdscr, curses):
+                    dirty = True
             continue
         dirty = False
 
@@ -2080,7 +2236,8 @@ def run_tui(stdscr, curses, fetcher, view):
         ], width)
         draw_segments(stdscr, curses, height - 1,
                       [(footer, "dim")], attrs, width)
-        stdscr.refresh()
+        if not refresher.refresh(stdscr, curses):
+            dirty = True
 
 
 def main():
@@ -2110,7 +2267,13 @@ def main():
     view = View()
     try:
         import curses
-        curses.wrapper(lambda stdscr: run_tui(stdscr, curses, fetcher, view))
+        output = CursesOutputBuffer()
+        try:
+            curses.wrapper(
+                lambda stdscr: run_tui(
+                    stdscr, curses, fetcher, view, output=output))
+        finally:
+            output.close()
     except KeyboardInterrupt:
         pass
     except Exception as exc:

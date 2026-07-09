@@ -98,6 +98,173 @@ class TestNonblockingInputPacing(unittest.TestCase):
         self.assertEqual(tui.frame_sleep_seconds(
             10.0 + tui._FRAME_INTERVAL, 10.0), 0.0)
 
+    def test_poll_key_does_not_call_getch_without_ready_input(self):
+        class Screen:
+            def getch(self):
+                raise AssertionError("getch must not run without readable input")
+
+        self.assertEqual(
+            tui.poll_key(Screen(), select_fn=lambda *_: ([], [], [])), -1)
+
+    def test_poll_key_reads_when_input_is_ready(self):
+        class Screen:
+            def getch(self):
+                return ord("r")
+
+        self.assertEqual(
+            tui.poll_key(Screen(), select_fn=lambda *_: ([0], [], [])),
+            ord("r"))
+
+
+class TestNonblockingOutput(unittest.TestCase):
+    class FakeCurses:
+        error = RuntimeError
+
+    class Screen:
+        def __init__(self):
+            self.calls = 0
+            self.touches = 0
+            self.blocked = True
+
+        def refresh(self):
+            self.calls += 1
+            if self.blocked:
+                raise BlockingIOError("PTY is full")
+
+        def touchwin(self):
+            self.touches += 1
+
+    def test_refresh_backpressure_is_dropped_and_retried(self):
+        now = [10.0]
+        screen = self.Screen()
+        refresher = tui.RefreshController(
+            clock=lambda: now[0], min_backoff=0.1, max_backoff=0.2)
+
+        self.assertFalse(refresher.refresh(screen, self.FakeCurses()))
+        self.assertEqual((screen.calls, screen.touches), (1, 1))
+
+        now[0] = 10.05
+        self.assertFalse(refresher.refresh(screen, self.FakeCurses()))
+        self.assertEqual(screen.calls, 1)  # bounded: no busy retry
+
+        now[0] = 10.1
+        screen.blocked = False
+        self.assertTrue(refresher.refresh(screen, self.FakeCurses()))
+        self.assertEqual(refresher.failures, 0)
+
+    def test_output_descriptor_is_restored(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            with os.fdopen(write_fd, "wb", closefd=False) as stream:
+                output = tui.CursesOutputBuffer(stream)
+                os.write(write_fd, b"frame")
+                self.assertEqual(output.take_frame(), b"frame")
+                self.assertTrue(output.send_frame(b"delivered"))
+                self.assertEqual(os.read(read_fd, 64), b"delivered")
+                output.close()
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+    @unittest.skipUnless(os.name == "posix" and hasattr(os, "fork"),
+                         "requires a POSIX pseudo-terminal")
+    def test_real_curses_loop_survives_an_unread_full_pty(self):
+        """Exercise ncurses itself while the terminal stops consuming output.
+
+        The child paints changing full screens into a PTY whose master is
+        intentionally never read. A blocking curses refresh stalls after only
+        a handful of frames; the nonblocking controller keeps heartbeats
+        flowing and exits normally.
+        """
+        import curses
+        import fcntl
+        import select
+        import signal
+        import struct
+        import termios
+        import time
+
+        master_fd, slave_fd = os.openpty()
+        heartbeat_read, heartbeat_write = os.pipe()
+        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ,
+                    struct.pack("HHHH", 24, 80, 0, 0))
+        child = os.fork()
+        if child == 0:
+            try:
+                os.close(master_fd)
+                os.close(heartbeat_read)
+                for fd in (0, 1, 2):
+                    os.dup2(slave_fd, fd)
+                if slave_fd > 2:
+                    os.close(slave_fd)
+
+                output = tui.CursesOutputBuffer()
+
+                def paint(stdscr):
+                    refresher = tui.RefreshController(output=output)
+                    deadline = time.monotonic() + 1.5
+                    frame = 0
+                    while time.monotonic() < deadline:
+                        char = "A" if frame % 2 else "B"
+                        stdscr.erase()
+                        height, width = stdscr.getmaxyx()
+                        for row in range(max(0, height - 1)):
+                            try:
+                                stdscr.addstr(row, 0, char * max(0, width - 1))
+                            except curses.error:
+                                pass
+                        refresher.refresh(stdscr, curses)
+                        os.write(heartbeat_write, b".")
+                        frame += 1
+                        time.sleep(0.005)
+
+                try:
+                    curses.wrapper(paint)
+                finally:
+                    output.close()
+                os._exit(0)
+            except BaseException:
+                os._exit(2)
+
+        os.close(slave_fd)
+        os.close(heartbeat_write)
+        status = None
+        beats = 0
+        deadline = time.monotonic() + 4.0
+        try:
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([heartbeat_read], [], [], 0.1)
+                if ready:
+                    chunk = os.read(heartbeat_read, 65536)
+                    if chunk:
+                        beats += len(chunk)
+                waited, child_status = os.waitpid(child, os.WNOHANG)
+                if waited == child:
+                    status = child_status
+                    break
+            if status is None:
+                def proc_text(name):
+                    try:
+                        with open("/proc/%d/%s" % (child, name)) as fh:
+                            return fh.read().strip()
+                    except OSError as exc:
+                        return type(exc).__name__
+
+                diagnostics = {
+                    "wchan": proc_text("wchan"),
+                    "syscall": proc_text("syscall"),
+                    "fdinfo": proc_text("fdinfo/1"),
+                }
+                os.kill(child, signal.SIGKILL)
+                _, status = os.waitpid(child, 0)
+                self.fail("curses child stalled under PTY backpressure: %r"
+                          % diagnostics)
+            self.assertEqual(os.waitstatus_to_exitcode(status), 0)
+            self.assertGreater(beats, 50)
+        finally:
+            os.close(heartbeat_read)
+            os.close(master_fd)
+
 
 class TestOwnerColors(unittest.TestCase):
     LAB_NAMES = [

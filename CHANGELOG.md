@@ -6,6 +6,20 @@ number so a client never falsely reports itself "behind the server".
 
 ---
 
+## 0.8.18 - TUI output backpressure resilience
+
+- Fixed long-running TUI freezes caused by ncurses blocking in `write(2)`
+  when a `kubectl exec` pseudo-terminal temporarily stopped draining output.
+- Buffered complete curses frames away from the remote PTY, forwarded them
+  nonblockingly with bounded retry backoff, and forced a full repaint after
+  recovery without truncating terminal escape sequences.
+- Added an independent zero-timeout input poll so terminal state churn cannot
+  put the UI thread back into a blocking `getch()` call.
+- Added a real POSIX pseudo-terminal regression test that fills an unread PTY
+  and verifies the curses loop remains live instead of stalling.
+
+---
+
 ## 0.8.17 - TUI startup fix
 
 - Fixed a TUI startup crash in the 0.8.16 owner-color palette registration
