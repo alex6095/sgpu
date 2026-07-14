@@ -6,7 +6,9 @@ decision logic: node shorthand expansion, the resolution precedence
 interactive commands.
 """
 
+import json
 import os
+import subprocess
 import sys
 import unittest
 from io import BytesIO
@@ -103,49 +105,375 @@ class _FakeTTY:
 
 
 class TestInteractiveReconnect(unittest.TestCase):
-    """The client must restore the terminal and reconnect after an abnormal
-    kubectl exec exit (e.g. 137 when the monitor pod is recreated)."""
+    """Fault-inject kubectl exec/pod states into the reconnect state machine."""
 
     def setUp(self):
-        self._stdout, self._stdin = sys.stdout, sys.stdin
+        self._stdout, self._stdin, self._stderr = sys.stdout, sys.stdin, sys.stderr
         sys.stdout = _FakeTTY()
         sys.stdin = _FakeTTY()
-        self._call = cli.subprocess.call
-        self._running = cli._pod_running
+        sys.stderr = _FakeTTY()
+        self._exec = cli._interactive_exec
+        self._pod_state_fn = cli._pod_state
+        self._wait = cli._wait_for_ready_pod
+        self._monotonic = cli.time.monotonic
         self._sleep = cli.time.sleep
-        cli.time.sleep = lambda s: None
-        cli._pod_running = lambda ns, pod: True
+        self._random = cli.random.random
+        self._recovery_window = cli._RECONNECT_RECOVERY_WINDOW_SECONDS
+        self._watchdog_stable = cli._WATCHDOG_STABLE_SESSION_SECONDS
+        self.sleeps = []
+        cli.time.sleep = lambda seconds: self.sleeps.append(seconds)
+        cli.time.monotonic = lambda: 0
+        cli.random.random = lambda: 0.5
+        cli._wait_for_ready_pod = (
+            lambda ns, pod, **kwargs: self._state("ready"))
 
     def tearDown(self):
-        sys.stdout, sys.stdin = self._stdout, self._stdin
-        cli.subprocess.call = self._call
-        cli._pod_running = self._running
+        sys.stdout, sys.stdin, sys.stderr = self._stdout, self._stdin, self._stderr
+        cli._interactive_exec = self._exec
+        cli._pod_state = self._pod_state_fn
+        cli._wait_for_ready_pod = self._wait
+        cli.time.monotonic = self._monotonic
         cli.time.sleep = self._sleep
+        cli.random.random = self._random
+        cli._RECONNECT_RECOVERY_WINDOW_SECONDS = self._recovery_window
+        cli._WATCHDOG_STABLE_SESSION_SECONDS = self._watchdog_stable
+
+    @staticmethod
+    def _state(uid="pod-a", ready=True, restart_count=0):
+        return {
+            "uid": uid,
+            "phase": "Running" if ready else "Pending",
+            "ready": ready,
+            "restart_count": restart_count,
+            "error": None,
+        }
+
+    def _exec_results(self, results):
+        calls = []
+        results = iter(results)
+
+        def fake_exec(command):
+            calls.append(command)
+            return next(results)
+
+        cli._interactive_exec = fake_exec
+        return calls
 
     def test_clean_exit_no_reconnect(self):
-        calls = []
-        cli.subprocess.call = lambda cmd: calls.append(cmd) or 0
+        cli._pod_state = lambda ns, pod: self._state()
+        calls = self._exec_results([(0, "")])
         self.assertEqual(cli._interactive("ns", "pod", ["x"], False), 0)
         self.assertEqual(len(calls), 1)
 
-    def test_137_restores_terminal_and_reconnects(self):
-        codes = iter([137, 0])
-        calls = []
-        cli.subprocess.call = lambda cmd: calls.append(cmd) or next(codes)
+    def test_rollout_replaces_pod_then_reconnects(self):
+        states = iter([self._state("old"), self._state("new")])
+        cli._pod_state = lambda ns, pod: next(states)
+        calls = self._exec_results([
+            (137, "command terminated with exit code 137\n"),
+            (0, ""),
+        ])
         self.assertEqual(cli._interactive("ns", "pod", ["x"], False), 0)
-        self.assertEqual(len(calls), 2)  # reconnected once
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.sleeps, [1])
         written = "".join(sys.stdout.buffer)
         self.assertIn(cli._TERM_RESTORE, written)
 
-    def test_gives_up_after_max_retries(self):
-        cli.subprocess.call = lambda cmd: 137
-        self.assertEqual(cli._interactive("ns", "pod", ["x"], False), 137)
+    def test_not_ready_pod_waits_before_reconnect(self):
+        states = iter([self._state("old"), self._state("old", ready=False)])
+        cli._pod_state = lambda ns, pod: next(states)
+        cli._wait_for_ready_pod = (
+            lambda ns, pod, **kwargs: self._state("new"))
+        calls = self._exec_results([(137, ""), (0, "")])
+        self.assertEqual(cli._interactive("ns", "pod", ["x"], False), 0)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.sleeps, [1])
+
+    def test_remote_tui_exit_one_is_not_misreported_as_a_rollout(self):
+        cli._pod_state = lambda ns, pod: self._state()
+        calls = self._exec_results([
+            (1, "command terminated with exit code 1\n"),
+        ])
+        self.assertEqual(cli._interactive("ns", "pod", ["x"], False), 1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.sleeps, [])
+        self.assertIn("not reconnecting", "".join(sys.stderr.buffer))
+
+    def test_auth_failure_does_not_retry_forever(self):
+        cli._pod_state = lambda ns, pod: self._state()
+        calls = self._exec_results([
+            (1, "Error from server (Forbidden): pods/exec is forbidden\n"),
+        ])
+        self.assertEqual(cli._interactive("ns", "pod", ["x"], False), 1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.sleeps, [])
+
+    def test_pod_state_auth_failure_is_permanent_even_when_exec_has_no_stderr(self):
+        forbidden = self._state(ready=False)
+        forbidden["error"] = "Error from server (Forbidden): pods is forbidden"
+        states = iter([self._state(), forbidden])
+        cli._pod_state = lambda ns, pod: next(states)
+        calls = self._exec_results([(1, "")])
+        self.assertEqual(cli._interactive("ns", "pod", ["x"], False), 1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.sleeps, [])
+        self.assertIn("check your access", "".join(sys.stderr.buffer))
+
+    def test_missing_pod_without_a_prior_lifecycle_is_not_retried(self):
+        missing = self._state(uid=None, ready=False)
+        missing["error"] = 'Error from server (NotFound): pods "pod" not found'
+        cli._pod_state = lambda ns, pod: missing
+        calls = self._exec_results([])
+        self.assertEqual(cli._interactive("ns", "pod", ["x"], False), 1)
+        self.assertEqual(len(calls), 0)
+        self.assertEqual(self.sleeps, [])
+        self.assertIn("cannot reach monitor pod", "".join(sys.stderr.buffer))
+
+    def test_initial_rbac_failure_fails_before_launching_exec_child(self):
+        denied = self._state(uid=None, ready=False)
+        denied["error"] = "Error from server (Forbidden): pods is forbidden"
+        cli._pod_state = lambda ns, pod: denied
+        calls = self._exec_results([])
+        self.assertEqual(cli._interactive("ns", "pod", ["x"], False), 1)
+        self.assertEqual(calls, [])
+        self.assertIn("check your access", "".join(sys.stderr.buffer))
+
+    def test_tui_output_watchdog_exit_reconnects_as_transport_loss(self):
+        cli._pod_state = lambda ns, pod: self._state()
+        calls = self._exec_results([
+            (75, "command terminated with exit code 75\n"),
+            (0, ""),
+        ])
+        self.assertEqual(
+            cli._interactive("ns", "pod", ["python3", "tui.py"], False), 0)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.sleeps, [1])
+
+    def test_long_lived_transport_losses_reset_the_failure_budget(self):
+        # Six EOFs exceed the old process-lifetime limit of five. Each fake
+        # session lasts one minute, so each has independently proved stable and
+        # starts a fresh transient-failure budget.
+        cli._pod_state = lambda ns, pod: self._state()
+        clock = iter([0, 60, 60, 61, 121, 121, 122, 182, 182,
+                      183, 243, 243, 244, 304, 304, 305, 365, 365,
+                      366])
+        cli.time.monotonic = lambda: next(clock)
+        calls = self._exec_results(
+            [(1, "unexpected EOF\n")] * 6 + [(0, "")])
+        self.assertEqual(cli._interactive("ns", "pod", ["x"], False), 0)
+        self.assertEqual(len(calls), 7)
+        self.assertEqual(self.sleeps, [1] * 6)
+        self.assertNotIn("giving up", "".join(sys.stderr.buffer))
+
+    def test_unstable_transport_burst_uses_extended_bounded_recovery(self):
+        cli._pod_state = lambda ns, pod: self._state()
+        calls = self._exec_results(
+            [(1, "unexpected EOF\n")] * 6 + [(0, "")])
+        self.assertEqual(cli._interactive("ns", "pod", ["x"], False), 0)
+        self.assertEqual(len(calls), 7)
+        self.assertEqual(self.sleeps, [1, 2, 4, 8, 16, 16])
+
+    def test_unstable_recovery_expires_at_its_window(self):
+        cli._RECONNECT_RECOVERY_WINDOW_SECONDS = 1
+        cli._pod_state = lambda ns, pod: self._state()
+        clock = iter([0] * 16 + [1])
+        cli.time.monotonic = lambda: next(clock)
+        calls = self._exec_results([(1, "unexpected EOF\n")] * 6)
+        self.assertEqual(cli._interactive("ns", "pod", ["x"], False), 1)
+        self.assertEqual(len(calls), 6)
+        self.assertEqual(self.sleeps, [1, 2, 4, 8, 16])
+        self.assertIn("recovery window expired", "".join(sys.stderr.buffer))
+
+    def test_repeated_watchdog_exits_keep_the_original_recovery_deadline(self):
+        """A 45s watchdog timeout must not look like a healthy 30s session."""
+        clock = [0.0]
+        self.sleeps = []
+        cli.time.monotonic = lambda: clock[0]
+
+        def sleep(seconds):
+            self.sleeps.append(seconds)
+            clock[0] += seconds
+
+        def watchdog_exec(_command):
+            # OUTPUT_STALL_SECONDS (45) is longer than the stable-session
+            # cutoff.  Every recovery attempt dies in this exact same way.
+            clock[0] += 45
+            return 75, "command terminated with exit code 75\n"
+
+        cli.time.sleep = sleep
+        cli._pod_state = lambda ns, pod: self._state()
+        cli._interactive_exec = watchdog_exec
+        cli._wait_for_ready_pod = (
+            lambda ns, pod, **kwargs: self._state("ready"))
+        self.assertEqual(
+            cli._interactive("ns", "pod", ["python3", "tui.py"], False),
+            75)
+        # Six reconnect sleeps occur before the seventh watchdog reaches the
+        # first recovery window's five-minute deadline and is bounded out.
+        self.assertEqual(self.sleeps, [1, 2, 4, 8, 16, 16])
+        self.assertIn("recovery window expired", "".join(sys.stderr.buffer))
+
+    def test_long_recovered_session_can_reset_before_watchdog_exit(self):
+        """A long healthy run must not inherit an ancient recovery deadline."""
+        clock = [0.0]
+        timeouts = []
+        cli._RECONNECT_RECOVERY_WINDOW_SECONDS = 10
+        cli.time.monotonic = lambda: clock[0]
+
+        def sleep(seconds):
+            self.sleeps.append(seconds)
+            clock[0] += seconds
+
+        outcomes = iter([
+            (1, "unexpected EOF\n", 0),
+            (75, "command terminated with exit code 75\n", 120),
+            (0, "", 0),
+        ])
+
+        def fake_exec(_command):
+            code, stderr, elapsed = next(outcomes)
+            clock[0] += elapsed
+            return code, stderr
+
+        def wait_ready(_ns, _pod, **kwargs):
+            timeouts.append(kwargs["timeout"])
+            return self._state() if kwargs["timeout"] > 0 else None
+
+        cli.time.sleep = sleep
+        cli._pod_state = lambda ns, pod: self._state()
+        cli._interactive_exec = fake_exec
+        cli._wait_for_ready_pod = wait_ready
+        self.assertEqual(
+            cli._interactive("ns", "pod", ["python3", "tui.py"], False),
+            0)
+        # The second 75 happened after two minutes of real output, so it gets
+        # a new 10s recovery window rather than the elapsed first window.
+        self.assertEqual(timeouts, [10, 10])
+        self.assertEqual(self.sleeps, [1, 1])
 
     def test_ctrl_c_does_not_reconnect(self):
-        def raise_interrupt(cmd):
-            raise KeyboardInterrupt()
-        cli.subprocess.call = raise_interrupt
+        cli._pod_state = lambda ns, pod: self._state()
+        self._exec_results([(130, "")])
         self.assertEqual(cli._interactive("ns", "pod", ["x"], False), 130)
+
+    def test_ctrl_c_while_waiting_for_readiness_stops_immediately(self):
+        states = iter([self._state(), self._state(ready=False)])
+        cli._pod_state = lambda ns, pod: next(states)
+
+        def interrupted_wait(*args, **kwargs):
+            raise KeyboardInterrupt()
+
+        cli._wait_for_ready_pod = interrupted_wait
+        self._exec_results([(1, "unexpected EOF\n")])
+        self.assertEqual(cli._interactive("ns", "pod", ["x"], False), 130)
+        self.assertEqual(self.sleeps, [])
+
+
+class TestInteractiveExecProcess(unittest.TestCase):
+    def test_fake_kubectl_like_process_surfaces_eof_diagnostic(self):
+        """A real child process is used to reproduce kubectl's EOF exit path."""
+        saved_stderr = sys.stderr
+        fake_stderr = _FakeTTY()
+        try:
+            sys.stderr = fake_stderr
+            code, diagnostic = cli._interactive_exec([
+                sys.executable,
+                "-c",
+                "import sys; sys.stderr.write('unexpected EOF\\n'); sys.exit(1)",
+            ])
+        finally:
+            sys.stderr = saved_stderr
+        self.assertEqual(code, 1)
+        self.assertEqual(diagnostic, "unexpected EOF\n")
+        self.assertIn(diagnostic, "".join(fake_stderr.buffer))
+
+
+class TestReconnectReadiness(unittest.TestCase):
+    def setUp(self):
+        self._state = cli._pod_state
+        self._health = cli._monitor_healthy
+        self._monotonic = cli.time.monotonic
+        self._sleep = cli.time.sleep
+        self._run = cli.subprocess.run
+
+    def tearDown(self):
+        cli._pod_state = self._state
+        cli._monitor_healthy = self._health
+        cli.time.monotonic = self._monotonic
+        cli.time.sleep = self._sleep
+        cli.subprocess.run = self._run
+
+    @staticmethod
+    def _ready_state():
+        return {"uid": "pod", "phase": "Running", "ready": True,
+                "restart_count": 0, "error": None}
+
+    def test_ready_pod_waits_for_health_with_bounded_probe_spacing(self):
+        now = [0.0]
+        sleeps = []
+        health = iter([False, True])
+        cli._pod_state = lambda ns, pod: self._ready_state()
+        cli._monitor_healthy = lambda ns, pod: next(health)
+        cli.time.monotonic = lambda: now[0]
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            now[0] += seconds
+
+        cli.time.sleep = sleep
+        self.assertEqual(
+            cli._wait_for_ready_pod("ns", "pod", require_health=True)["uid"],
+            "pod")
+        self.assertEqual(sleeps, [1])
+
+    def test_health_outage_can_recover_beyond_the_old_sixty_second_wait(self):
+        now = [0.0]
+        sleeps = []
+        cli._pod_state = lambda ns, pod: self._ready_state()
+        cli._monitor_healthy = lambda ns, pod: False
+        cli.time.monotonic = lambda: now[0]
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            now[0] += seconds
+
+        cli.time.sleep = sleep
+        self.assertGreater(cli._RECONNECT_RECOVERY_WINDOW_SECONDS, 60)
+        self.assertIsNone(
+            cli._wait_for_ready_pod("ns", "pod", require_health=True,
+                                    timeout=61))
+        self.assertEqual(sleeps, [1, 2, 4, 8, 16, 16, 14])
+
+    def test_fake_kubectl_reports_uid_ready_restart_and_health(self):
+        pod_json = json.dumps({
+            "metadata": {"uid": "pod-uid"},
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "containerStatuses": [{"restartCount": 12}],
+            },
+        })
+        calls = []
+
+        def fake_kubectl(command, **kwargs):
+            calls.append(command)
+            if command[1:3] == ["get", "pod"]:
+                return subprocess.CompletedProcess(command, 0, stdout=pod_json,
+                                                   stderr="")
+            return subprocess.CompletedProcess(command, 0, stdout="503",
+                                               stderr="")
+
+        cli.subprocess.run = fake_kubectl
+        state = cli._pod_state("ns", "pod")
+        self.assertEqual((state["uid"], state["ready"], state["restart_count"]),
+                         ("pod-uid", True, 12))
+        self.assertTrue(cli._monitor_healthy("ns", "pod"))
+        self.assertIn("curl", calls[-1])
+
+    def test_backoff_jitter_is_bounded(self):
+        self.assertEqual(cli._reconnect_delay(1, random_value=0), 0.8)
+        self.assertEqual(cli._reconnect_delay(1, random_value=1), 1.2)
+        self.assertEqual(cli._reconnect_delay(9, random_value=0), 12.8)
+        self.assertEqual(cli._reconnect_delay(9, random_value=1), 16)
 
 
 class TestVersionCompare(unittest.TestCase):

@@ -89,6 +89,63 @@ class TestStatsSpinner(unittest.TestCase):
                       tui.STATS_SPIN_ASCII)
 
 
+class TestStatsPulse(unittest.TestCase):
+    def _insights(self):
+        return {
+            "has_device_telemetry": True,
+            "util_avg": 57.0,
+            "vram_avg": 41.0,
+            "util_by_hour_kst": [0, 20, 45, 90] * 6,
+            "util_bands": {"hot": 35.0},
+            "busy_windows": 4,
+            "telemetry_dates_covered": ["20260706"],
+            "available_dates_covered": ["20260701", "20260702",
+                                        "20260703", "20260704",
+                                        "20260705", "20260706",
+                                        "20260707"],
+        }
+
+    def test_wide_pulse_keeps_spark_and_partial_coverage(self):
+        text = tui.format_pulse_summary(self._insights(), width=100,
+                                        unicode_ok=True)
+        self.assertIn("PULSE KST", text)
+        self.assertIn("57%", text)
+        self.assertIn("partial 1/7d", text)
+        self.assertTrue(any(glyph in text for glyph in "▁▂▃▄▅▆▇█"))
+
+    def test_ascii_and_narrow_pulse_are_safe(self):
+        ascii_text = tui.format_pulse_summary(self._insights(), width=70,
+                                              unicode_ok=False)
+        self.assertIn("PULSE", ascii_text)
+        self.assertNotIn("▁", ascii_text)
+        narrow = tui.format_pulse_summary(self._insights(), width=45,
+                                          unicode_ok=False)
+        self.assertIn("PULSE util 57%", narrow)
+
+    def test_lab_partial_coverage_uses_node_days(self):
+        insights = self._insights()
+        insights["telemetry_coverage"] = {
+            "covered": 7, "available": 14, "unit": "node-days"}
+        insights["has_flow"] = True
+        insights["flow_scope"] = "node"
+        text = tui.format_pulse_summary(insights, width=100,
+                                        unicode_ok=False)
+        self.assertIn("partial 7/14 node-days", text)
+        self.assertIn("4 node windows", text)
+
+    def test_old_rollup_has_no_pulse_line(self):
+        self.assertIsNone(tui.format_pulse_summary({
+            "has_device_telemetry": False}, width=100))
+
+    def test_momentum_prefers_current_streak(self):
+        text = tui.format_momentum_summary([
+            {"owner": "youngju", "observed_days": 7, "active_days": 6,
+             "current_streak_days": 4},
+        ], width=100)
+        self.assertIn("MOMENTUM youngju", text)
+        self.assertIn("4d streak", text)
+
+
 class TestNonblockingInputPacing(unittest.TestCase):
     def test_frame_sleep_seconds_until_next_frame(self):
         self.assertAlmostEqual(
@@ -134,6 +191,15 @@ class TestNonblockingOutput(unittest.TestCase):
         def touchwin(self):
             self.touches += 1
 
+    class StalledOutput:
+        broken = False
+
+        def flush_pending(self):
+            return False
+
+        def stalled(self, now, timeout):
+            return True
+
     def test_refresh_backpressure_is_dropped_and_retried(self):
         now = [10.0]
         screen = self.Screen()
@@ -152,6 +218,13 @@ class TestNonblockingOutput(unittest.TestCase):
         self.assertTrue(refresher.refresh(screen, self.FakeCurses()))
         self.assertEqual(refresher.failures, 0)
 
+    def test_output_watchdog_exits_after_sustained_no_progress(self):
+        refresher = tui.RefreshController(
+            clock=lambda: 10.0, output=self.StalledOutput(),
+            output_stall_seconds=5)
+        with self.assertRaises(tui.OutputDisconnected):
+            refresher.refresh(self.Screen(), self.FakeCurses())
+
     def test_output_descriptor_is_restored(self):
         read_fd, write_fd = os.pipe()
         try:
@@ -166,15 +239,40 @@ class TestNonblockingOutput(unittest.TestCase):
             os.close(read_fd)
             os.close(write_fd)
 
+    def test_pending_output_tolerates_brief_backpressure_then_marks_stalled(self):
+        now = [0.0]
+        read_fd, write_fd = os.pipe()
+        stream = os.fdopen(write_fd, "wb", closefd=True)
+        output = None
+        try:
+            output = tui.CursesOutputBuffer(stream, clock=lambda: now[0])
+            while True:
+                try:
+                    os.write(output.real_fd, b"x" * 65536)
+                except BlockingIOError:
+                    break
+            self.assertFalse(output.send_frame(b"frame"))
+            self.assertFalse(output.stalled(4.9, 5))
+            self.assertTrue(output.stalled(5.0, 5))
+            # close() must not wait for the permanently full consumer.
+            output.close()
+            output = None
+        finally:
+            if output is not None:
+                output.close()
+            stream.close()
+            os.close(read_fd)
+
     @unittest.skipUnless(os.name == "posix" and hasattr(os, "fork"),
                          "requires a POSIX pseudo-terminal")
-    def test_real_curses_loop_survives_an_unread_full_pty(self):
-        """Exercise ncurses itself while the terminal stops consuming output.
+    def test_real_curses_loop_exits_when_unread_pty_never_recovers(self):
+        """A disconnected exec PTY must not leave an orphan TUI process.
 
         The child paints changing full screens into a PTY whose master is
-        intentionally never read. A blocking curses refresh stalls after only
-        a handful of frames; the nonblocking controller keeps heartbeats
-        flowing and exits normally.
+        intentionally never read. A short output stall is harmless, but once
+        no byte reaches the PTY for the watchdog window the child exits. The
+        parent waits for that exact child, making orphan-process regressions
+        deterministic.
         """
         import curses
         import fcntl
@@ -199,10 +297,12 @@ class TestNonblockingOutput(unittest.TestCase):
                     os.close(slave_fd)
 
                 output = tui.CursesOutputBuffer()
+                disconnected = [False]
 
                 def paint(stdscr):
-                    refresher = tui.RefreshController(output=output)
-                    deadline = time.monotonic() + 1.5
+                    refresher = tui.RefreshController(
+                        output=output, output_stall_seconds=0.25)
+                    deadline = time.monotonic() + 2.0
                     frame = 0
                     while time.monotonic() < deadline:
                         char = "A" if frame % 2 else "B"
@@ -213,7 +313,11 @@ class TestNonblockingOutput(unittest.TestCase):
                                 stdscr.addstr(row, 0, char * max(0, width - 1))
                             except curses.error:
                                 pass
-                        refresher.refresh(stdscr, curses)
+                        try:
+                            refresher.refresh(stdscr, curses)
+                        except tui.OutputDisconnected:
+                            disconnected[0] = True
+                            return
                         os.write(heartbeat_write, b".")
                         frame += 1
                         time.sleep(0.005)
@@ -222,7 +326,7 @@ class TestNonblockingOutput(unittest.TestCase):
                     curses.wrapper(paint)
                 finally:
                     output.close()
-                os._exit(0)
+                os._exit(0 if disconnected[0] else 3)
             except BaseException:
                 os._exit(2)
 
@@ -260,7 +364,7 @@ class TestNonblockingOutput(unittest.TestCase):
                 self.fail("curses child stalled under PTY backpressure: %r"
                           % diagnostics)
             self.assertEqual(os.waitstatus_to_exitcode(status), 0)
-            self.assertGreater(beats, 50)
+            self.assertGreater(beats, 5)
         finally:
             os.close(heartbeat_read)
             os.close(master_fd)

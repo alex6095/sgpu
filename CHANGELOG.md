@@ -4,6 +4,35 @@ All notable changes to **sgpu**, newest first. Versions are lockstepped: the
 PyPI client and the `docker.io/alex6095/sgpu-monitor` server image share one
 number so a client never falsely reports itself "behind the server".
 
+## 0.8.19 - Self-healing sessions and cluster pulse
+
+- Fixed the real long-session failure mode: a disconnected `kubectl exec`
+  stream could leave its remote pseudo-terminal and TUI alive indefinitely,
+  continuing to poll the monitor after the local client had already exited.
+- Added a byte-progress watchdog that terminates an orphaned remote TUI after
+  sustained output blockage while still tolerating short backpressure.
+- Replaced the lifetime five-retry counter with pod UID/Ready/restart/health
+  checks, permanent-vs-transient error classification, a resettable failure
+  budget, and bounded exponential recovery with jitter.
+- Added a terminal-native Cluster pulse with KST utilization/VRAM sparklines,
+  utilization zones, observed compute-window cadence, and owner Momentum.
+- Introduced rollup schema v2 using compact weighted telemetry accumulators;
+  retained v1 history upgrades lazily and atomically when raw data is present,
+  with safe missing-data and concurrent-request behavior.
+- Added deterministic transport, real unread-PTY, metric, narrow/ASCII render,
+  migration, read-only, and concurrent-upgrade regression tests.
+- Kept repeated default 45-second unread-PTY watchdog exits inside one bounded
+  recovery window, while allowing a genuinely long recovered session to start
+  a fresh budget; initial RBAC and missing-pod probes now fail before `exec`.
+- Stitched Flow across UTC daily boundaries; LAB output explicitly reports the
+  exact sum of node compute windows and longest per-node window rather than a
+  fictional cross-node union, and marks partial telemetry by node-day.
+- Hardened retained raw telemetry against NaN/null device and process values.
+- Made daily raw rollups adapt to confirmed sustained sampler cadence changes
+  (including 15/16s to 60/61s) without changing the compatible daily median;
+  normal slower samples retain full credit and one Flow window, while missing
+  telemetry still has bounded credit and breaks Flow.
+
 ---
 
 ## 0.8.18 - TUI output backpressure resilience

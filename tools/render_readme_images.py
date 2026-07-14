@@ -104,8 +104,14 @@ GPU  OWNER     POD                                             PID   SM%      ME
 """
 
 
-SAMPLE_STATS = """SGPU usage report - last 30 days
-data: 7 days, coverage 99.2%
+SAMPLE_STATS = """SGPU usage report - last 30 days - all nodes (node-01+node-02)
+data: 7 days, coverage 168.0h
+
+Cluster pulse
+KST  UTIL ▁▁▂▃▄▆▇█▇▆▄▃▂▂▃▄▆▇▆▄▃▂▁▁  avg 54%  hot 31%
+     VRAM ▁▂▂▃▄▅▆▇▇▆▅▄▃▃▄▅▆▇▇▆▄▃▂▁  avg 47%
+UTIL mix  quiet 23%  light 18%  work 28%  hot 31%
+Flow      12 node compute windows - longest 9h18m per-node (any GPU >= 50%)
 
 Awards
 * Best researcher: atlas - 123.4 effective GPU-h (76% avg over 162.4 GPU-h)
@@ -117,6 +123,9 @@ OWNER     GPU-H  EFF-H  AVG-SM%  AVG-UTIL%  PEAK-MEM  ALLOC-H   IDLE-H  IDLE%
 orion     188.0  132.5       70         73      91.2    188.0      3.2      2
 atlas     162.4  123.4       76         78      81.1    162.4      0.0      0
 nova       64.8   59.0       91         94      61.0     64.8      0.0      0
+
+Momentum
+atlas 7d streak - 7/7d - 76% eff  |  nova 5d streak - 6/7d - 91% eff
 
 KST hour activity (gpu-seconds share)
 KST      0     3     6     9     12    15    18    21
@@ -365,7 +374,7 @@ def main() -> None:
     )
     render_terminal_svg(
         title="Usage stats and activity",
-        subtitle="GPU-hours, awards and KST heatmap",
+        subtitle="cluster pulse, momentum, GPU-hours and KST heatmap",
         body=stats,
         path=OUT / "sgpu-stats.svg",
         width=1480,

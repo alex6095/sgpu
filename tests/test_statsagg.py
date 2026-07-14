@@ -2,11 +2,14 @@
 
 import gzip
 import json
+import math
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timezone
+from unittest import mock
 
 # --- sys.path shim: make tools/gpu-monitor importable ---
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -76,6 +79,137 @@ class TestDtGapRule(unittest.TestCase):
         # owner "a" active on 1 gpu each sample -> gpu_seconds == coverage
         self.assertAlmostEqual(roll["owners"]["a"]["gpu_seconds"], 75.0,
                                places=6)
+        # The two-hour observation gap is also a cadence boundary: it must not
+        # turn two observed busy periods into one synthetic 75-second window.
+        self.assertEqual(roll["cluster"]["busy_windows"], 2)
+        self.assertAlmostEqual(roll["cluster"]["longest_busy_seconds"], 45.0)
+
+
+class TestAdaptiveCadence(unittest.TestCase):
+    def _rollup(self, records, gzipped=False):
+        with tempfile.TemporaryDirectory() as d:
+            return statsagg.build_rollup(
+                write_day(d, "20260708", records, gzipped=gzipped))
+
+    def test_sustained_15_to_60_transition_keeps_one_busy_window(self):
+        # Matches the production distribution shape: a 15-second first half
+        # followed by 725 normal 60-second samples.  The daily median remains
+        # 15 for compatibility, but the confirmed 60s segment gets full dt.
+        base = 1751860000
+        fast_count = 2829
+        slow_count = 725
+        offsets = [15 * i for i in range(fast_count)]
+        for _ in range(slow_count):
+            offsets.append(offsets[-1] + 60)
+        records = [sample(ts_at(base, offset), gpus=[gpu(0, 90)],
+                          procs=[proc(1, 0, "a")])
+                   for offset in offsets]
+
+        roll = self._rollup(records, gzipped=True)
+        expected = 15 + (fast_count - 1) * 15 + slow_count * 60
+        self.assertEqual(len(records), 3554)
+        self.assertEqual(roll["samples"], 3554)
+        self.assertEqual(roll["interval_hint"], 15)
+        self.assertAlmostEqual(roll["coverage_seconds"], expected)
+        self.assertAlmostEqual(roll["owners"]["a"]["gpu_seconds"],
+                               expected)
+        self.assertEqual(roll["cluster"]["busy_windows"], 1)
+        self.assertAlmostEqual(roll["cluster"]["longest_busy_seconds"],
+                               expected)
+
+    def test_sustained_60_to_15_transition_uses_initial_profile(self):
+        base = 1751860000
+        offsets = [0, 60, 120, 180, 240, 255, 270, 285, 300, 315]
+        records = [sample(ts_at(base, offset), gpus=[gpu(0, 90)], procs=[])
+                   for offset in offsets]
+
+        roll = self._rollup(records)
+        # Five 15s gaps make the historical daily median 15, even though the
+        # day started at 60s.  Initial profile detection must still credit it.
+        self.assertEqual(roll["interval_hint"], 15)
+        self.assertAlmostEqual(roll["coverage_seconds"], 375.0)
+        self.assertEqual(roll["cluster"]["busy_windows"], 1)
+
+    def test_sustained_large_interval_transition_is_not_size_limited(self):
+        base = 1751860000
+        # An operator may legally change SGPU_SAMPLE_INTERVAL by far more than
+        # 8x.  Three matching 900s gaps are stronger evidence than the gap
+        # size; meanwhile the daily median remains the earlier 15 seconds.
+        offsets = [0, 15, 30, 45, 60, 75, 975, 1875, 2775, 3675]
+        records = [sample(ts_at(base, offset), gpus=[gpu(0, 90)], procs=[])
+                   for offset in offsets]
+
+        roll = self._rollup(records)
+        self.assertEqual(roll["interval_hint"], 15)
+        self.assertAlmostEqual(roll["coverage_seconds"], 3690.0)
+        self.assertEqual(roll["cluster"]["busy_windows"], 1)
+        self.assertAlmostEqual(roll["cluster"]["longest_busy_seconds"],
+                               3690.0)
+
+    def test_jitter_and_one_missed_sample_do_not_create_a_transition(self):
+        base = 1751860000
+        # 20s is ordinary jitter and 30s is one missed 15s poll, both inside
+        # the current 2x cadence cap.
+        offsets = [0, 15, 30, 50, 80, 95, 110]
+        records = [sample(ts_at(base, offset), gpus=[gpu(0, 90)], procs=[])
+                   for offset in offsets]
+
+        roll = self._rollup(records)
+        self.assertEqual(roll["interval_hint"], 15)
+        self.assertAlmostEqual(roll["coverage_seconds"], 125.0)
+        self.assertEqual(roll["cluster"]["busy_windows"], 1)
+
+    def test_isolated_235_second_delay_is_capped_and_splits_flow(self):
+        base = 1751860000
+        # This is a one-off collector delay, not a new 235s cadence.  It is
+        # capped to 30 seconds for usage and, as missing telemetry, breaks
+        # the observed Flow window.
+        offsets = [0, 15, 30, 265, 280, 295]
+        records = [sample(ts_at(base, offset), gpus=[gpu(0, 90)], procs=[])
+                   for offset in offsets]
+
+        roll = self._rollup(records)
+        self.assertEqual(roll["interval_hint"], 15)
+        self.assertAlmostEqual(roll["coverage_seconds"], 105.0)
+        self.assertEqual(roll["cluster"]["busy_windows"], 2)
+        self.assertAlmostEqual(roll["cluster"]["longest_busy_seconds"],
+                               60.0)
+
+    def test_confirmed_transition_followed_by_outage_is_capped_and_split(self):
+        base = 1751860000
+        # Five 15s gaps establish the initial cadence; three 60s gaps confirm
+        # the slower cadence.  A later 2h outage must get at most 2*60 credit
+        # and cannot be swallowed as another cadence transition.
+        offsets = [0, 15, 30, 45, 60, 75, 135, 195, 255, 7455]
+        records = [sample(ts_at(base, offset), gpus=[gpu(0, 90)], procs=[])
+                   for offset in offsets]
+
+        roll = self._rollup(records)
+        self.assertEqual(roll["interval_hint"], 15)
+        self.assertAlmostEqual(roll["coverage_seconds"], 390.0)
+        self.assertEqual(roll["cluster"]["busy_windows"], 2)
+        self.assertAlmostEqual(roll["cluster"]["longest_busy_seconds"],
+                               270.0)
+
+    def test_duplicate_out_of_order_and_null_timestamps_do_not_poison_flow(self):
+        base = 1751860000
+        records = [
+            sample(ts_at(base, 0), gpus=[gpu(0, 90)], procs=[]),
+            sample(ts_at(base, 15), gpus=[gpu(0, 90)], procs=[]),
+            sample(None, gpus=[gpu(0, 90)], procs=[]),
+            sample(ts_at(base, 15), gpus=[gpu(0, 90)], procs=[]),
+            sample(ts_at(base, 10), gpus=[gpu(0, 90)], procs=[]),
+            sample(ts_at(base, 30), gpus=[gpu(0, 90)], procs=[]),
+            sample(ts_at(base, 45), gpus=[gpu(0, 90)], procs=[]),
+        ]
+
+        roll = self._rollup(records)
+        self.assertEqual(roll["samples"], 6)
+        self.assertEqual(roll["interval_hint"], 15)
+        self.assertAlmostEqual(roll["coverage_seconds"], 60.0)
+        self.assertEqual(roll["cluster"]["busy_windows"], 1)
+        self.assertAlmostEqual(roll["owners"].get("missing", {}).get(
+            "gpu_seconds", 0.0), 0.0)
 
 
 class TestSharedGpuUtil(unittest.TestCase):
@@ -140,6 +274,434 @@ class TestKstBinning(unittest.TestCase):
                 self.assertEqual(hist[h], 0.0)
 
 
+class TestClusterTelemetry(unittest.TestCase):
+    def _records(self, base):
+        # Four deterministic 15s slices: idle, hot, hot, idle.  The same raw
+        # fields have existed since sample v1, so no sampler schema change is
+        # needed to derive the v2 cluster profile.
+        return [
+            sample(ts_at(base, 0), gpus=[{
+                "i": 0, "util": 0, "mem": 0, "mem_total": 100}],
+                   procs=[proc(1, 0, "a")]),
+            sample(ts_at(base, 15), gpus=[{
+                "i": 0, "util": 100, "mem": 50, "mem_total": 100}],
+                   procs=[proc(1, 0, "a")]),
+            sample(ts_at(base, 30), gpus=[{
+                "i": 0, "util": 100, "mem": 100, "mem_total": 100}],
+                   procs=[proc(1, 0, "a")]),
+            sample(ts_at(base, 45), gpus=[{
+                "i": 0, "util": 0, "mem": 0, "mem_total": 100}],
+                   procs=[proc(1, 0, "a")]),
+        ]
+
+    def test_profile_and_observed_windows(self):
+        base = int(datetime(2026, 7, 7, 1, 0, 0,
+                            tzinfo=timezone.utc).timestamp())
+        with tempfile.TemporaryDirectory() as d:
+            roll = statsagg.build_rollup(
+                write_day(d, "20260707", self._records(base)))
+        cluster = roll["cluster"]
+        self.assertEqual(roll["v"], statsagg.ROLLUP_VERSION)
+        self.assertAlmostEqual(cluster["device_seconds"], 60.0)
+        self.assertAlmostEqual(cluster["util_wsum"] / cluster["util_weight"],
+                               50.0)
+        self.assertAlmostEqual(cluster["mem_wsum"] / cluster["mem_weight"],
+                               37.5)
+        self.assertEqual(cluster["busy_windows"], 1)
+        self.assertEqual(cluster["idle_windows"], 2)
+        self.assertAlmostEqual(cluster["longest_busy_seconds"], 30.0)
+        self.assertEqual(cluster["telemetry_days"], 1)
+        insights = statsagg.cluster_insights(roll)
+        self.assertTrue(insights["has_device_telemetry"])
+        self.assertAlmostEqual(insights["util_bands"]["quiet"], 50.0)
+        self.assertAlmostEqual(insights["util_bands"]["hot"], 50.0)
+
+    def test_null_and_v1_cluster_do_not_become_fake_zero_percent(self):
+        # A v1 owner rollup has no valid device-time denominator.  It may
+        # still merge owner accounting, but the pulse must disappear entirely.
+        legacy = {
+            "v": 1,
+            "date": "20260706",
+            "samples": 2,
+            "owners": {"a": statsagg._empty_owner()},
+        }
+        merged = statsagg.merge_rollups([legacy])
+        insights = statsagg.cluster_insights(merged)
+        self.assertFalse(insights["has_device_telemetry"])
+        self.assertIsNone(insights["util_avg"])
+        self.assertEqual(merged["cluster"]["util_weight"], 0.0)
+
+    def test_nan_and_null_raw_values_do_not_poison_owner_or_cluster_totals(self):
+        base = int(datetime(2026, 7, 7, 1, 0, 0,
+                            tzinfo=timezone.utc).timestamp())
+        records = [
+            sample(ts_at(base, 0), gpus=[{
+                "i": 0, "util": float("nan"), "mem": float("nan"),
+                "mem_total": 100}], procs=[{
+                    "pid": 1, "gpu": 0, "owner": "a", "pod": "a-pod",
+                    "mem": float("nan"), "sm": float("nan")}]),
+            sample(ts_at(base, 15), gpus=[{
+                "i": 0, "util": 40, "mem": None, "mem_total": 100}],
+                   procs=[proc(1, 0, "a", sm=None, mem=None)]),
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            roll = statsagg.build_rollup(
+                write_day(d, "20260707", records))
+        owner = roll["owners"]["a"]
+        self.assertAlmostEqual(owner["util_wsum"], 40.0 * 15.0)
+        self.assertAlmostEqual(owner["util_weight"], 15.0)
+        self.assertEqual(owner["sm_weight"], 0.0)
+        self.assertAlmostEqual(
+            roll["cluster"]["util_wsum"] / roll["cluster"]["util_weight"],
+            40.0)
+
+    def test_contiguous_busy_flow_is_stitched_across_midnight(self):
+        now = datetime(2026, 7, 7, 12, 0, 0, tzinfo=timezone.utc)
+        def busy(ts):
+            return sample(ts, gpus=[gpu(0, 90)], procs=[])
+        with tempfile.TemporaryDirectory() as d:
+            write_day(d, "20260706", [
+                busy("2026-07-06T23:59:30Z"),
+                busy("2026-07-06T23:59:45Z"),
+            ])
+            write_day(d, "20260707", [
+                busy("2026-07-07T00:00:00Z"),
+                busy("2026-07-07T00:00:15Z"),
+            ])
+            result = statsagg.query(d, days=2, now_fn=lambda: now)
+        insights = result["insights"]
+        self.assertTrue(insights["has_flow"])
+        self.assertEqual(insights["busy_windows"], 1)
+        self.assertAlmostEqual(insights["longest_busy_seconds"], 60.0)
+
+
+class TestRollupCompatibility(unittest.TestCase):
+    def _legacy_rollup(self, directory, base):
+        raw = write_day(directory, "20260706", [
+            sample(ts_at(base, 0), gpus=[{
+                "i": 0, "util": 80, "mem": 40, "mem_total": 100}],
+                   procs=[proc(1, 0, "a")]),
+            sample(ts_at(base, 15), gpus=[{
+                "i": 0, "util": 80, "mem": 50, "mem_total": 100}],
+                   procs=[proc(1, 0, "a")]),
+        ])
+        legacy = statsagg.build_rollup(raw)
+        legacy["v"] = 1
+        legacy.pop("cluster", None)
+        with open(os.path.join(directory, "rollup-20260706.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump(legacy, fh)
+        return raw
+
+    def test_v1_rollup_is_lazily_upgraded_once_when_raw_exists(self):
+        now = datetime(2026, 7, 7, 12, 0, 0, tzinfo=timezone.utc)
+        base = int(datetime(2026, 7, 6, 1, 0, 0,
+                            tzinfo=timezone.utc).timestamp())
+        with tempfile.TemporaryDirectory() as d:
+            self._legacy_rollup(d, base)
+            result = statsagg.query(d, days=2, now_fn=lambda: now)
+            with open(os.path.join(d, "rollup-20260706.json"),
+                      encoding="utf-8") as fh:
+                upgraded = json.load(fh)
+            self.assertEqual(upgraded["v"], statsagg.ROLLUP_VERSION)
+            self.assertIn("cluster", upgraded)
+            self.assertTrue(result["insights"]["has_device_telemetry"])
+            self.assertEqual(result["telemetry_dates_covered"], ["20260706"])
+
+            # The persisted v2 shape is trusted on the next query; no raw
+            # rebuild is attempted a second time.
+            with mock.patch.object(statsagg, "build_rollup",
+                                   side_effect=AssertionError("rebuilt twice")):
+                statsagg.query(d, days=2, now_fn=lambda: now)
+
+    def test_read_only_upgrade_uses_cached_rebuild_without_harming_v1_file(self):
+        now = datetime(2026, 7, 7, 12, 0, 0, tzinfo=timezone.utc)
+        base = int(datetime(2026, 7, 6, 1, 0, 0,
+                            tzinfo=timezone.utc).timestamp())
+        with tempfile.TemporaryDirectory() as d:
+            self._legacy_rollup(d, base)
+            statsagg._LEGACY_REBUILD_CACHE.clear()
+            real_build = statsagg.build_rollup
+            with mock.patch.object(statsagg, "build_rollup", wraps=real_build) as built, \
+                    mock.patch.object(statsagg.os, "replace",
+                                      side_effect=OSError("read-only")):
+                first = statsagg.query(d, days=2, now_fn=lambda: now)
+                second = statsagg.query(d, days=2, now_fn=lambda: now)
+            self.assertEqual(built.call_count, 1)
+            self.assertTrue(first["insights"]["has_device_telemetry"])
+            self.assertTrue(second["insights"]["has_device_telemetry"])
+            # Atomic write failure leaves the last known-good v1 file alone.
+            with open(os.path.join(d, "rollup-20260706.json"),
+                      encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh)["v"], 1)
+            self.assertFalse([name for name in os.listdir(d)
+                              if name.endswith(".tmp")])
+
+    def test_v1_without_raw_keeps_owner_stats_and_omits_pulse(self):
+        now = datetime(2026, 7, 7, 12, 0, 0, tzinfo=timezone.utc)
+        base = int(datetime(2026, 7, 6, 1, 0, 0,
+                            tzinfo=timezone.utc).timestamp())
+        with tempfile.TemporaryDirectory() as d:
+            raw = self._legacy_rollup(d, base)
+            os.remove(raw)
+            result = statsagg.query(d, days=2, now_fn=lambda: now)
+        self.assertIn("a", result["merged"]["owners"])
+        self.assertFalse(result["insights"]["has_device_telemetry"])
+        self.assertEqual(result["telemetry_dates_covered"], [])
+        self.assertNotIn("Cluster pulse", statsagg.render_stats_text(result))
+
+    def test_raw_absent_v1_null_nan_and_text_fields_are_ignored_safely(self):
+        """A damaged retained rollup must still yield a truthful safe report."""
+        now = datetime(2026, 7, 7, 12, 0, 0, tzinfo=timezone.utc)
+        legacy = {
+            "v": 1,
+            "date": "20260706",
+            "samples": None,
+            "coverage_seconds": "not-a-number",
+            "pods_coverage_seconds": float("nan"),
+            "first_ts": "2026-07-06T00:00:00Z",
+            "last_ts": "2026-07-06T00:00:15Z",
+            "owners": {
+                "a": {
+                    "gpu_seconds": None,
+                    "sm_wsum": float("nan"),
+                    "sm_weight": "bad",
+                    "util_wsum": 80.0,
+                    "util_weight": None,
+                    "mem_wsum": float("nan"),
+                    "mem_weight": None,
+                    "mem_peak_mib": "bad",
+                    "mem_total_mib": None,
+                    "alloc_gpu_seconds": None,
+                    "idle_gpu_seconds": float("nan"),
+                    "hour_hist_kst": [None, float("nan"), "bad"],
+                },
+            },
+            "pods": {
+                "a-pod": {
+                    "owner": "a", "first_ts": None, "last_ts": None,
+                    "max_gpus": None, "peak_mem_mib": "bad",
+                    "gpu_seconds": float("nan"), "req": None,
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "rollup-20260706.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump(legacy, fh)
+            result = statsagg.query(d, days=2, now_fn=lambda: now)
+        owner = result["merged"]["owners"]["a"]
+        self.assertTrue(all(math.isfinite(owner[key]) for key in (
+            "gpu_seconds", "sm_wsum", "sm_weight", "util_wsum",
+            "util_weight", "mem_wsum", "mem_weight",
+            "alloc_gpu_seconds", "idle_gpu_seconds")))
+        self.assertTrue(all(math.isfinite(value)
+                            for value in owner["hour_hist_kst"]))
+        self.assertFalse(result["insights"]["has_device_telemetry"])
+        text = statsagg.render_stats_text(result, color=False)
+        self.assertNotIn("nan", text.lower())
+
+
+class TestRollupWriteConcurrency(unittest.TestCase):
+    def test_concurrent_writers_use_unique_durable_temps(self):
+        """Two lazy-upgrade writers can race without sharing/truncating temp."""
+        with tempfile.TemporaryDirectory() as d:
+            out_path = os.path.join(d, "rollup-20260706.json")
+            rolls = [{"v": 2, "date": "20260706", "writer": "one"},
+                     {"v": 2, "date": "20260706", "writer": "two"}]
+            barrier = threading.Barrier(2)
+            replace_calls = []
+            replace_lock = threading.Lock()
+            errors = []
+            real_replace = os.replace
+            real_fsync = os.fsync
+
+            def synchronized_replace(src, dst):
+                with replace_lock:
+                    replace_calls.append(src)
+                return real_replace(src, dst)
+
+            def synchronized_fsync(fd):
+                # Both writers have completed their independent temp-file
+                # writes before either can perform its final rename.  A fixed
+                # shared *.tmp would make one later replace fail.
+                barrier.wait(timeout=5)
+                return real_fsync(fd)
+
+            def writer(roll):
+                try:
+                    statsagg._write_rollup_file(out_path, roll)
+                except Exception as exc:
+                    errors.append(exc)
+
+            with mock.patch.object(statsagg.os, "replace",
+                                   side_effect=synchronized_replace), \
+                    mock.patch.object(statsagg.os, "fsync",
+                                      side_effect=synchronized_fsync) as synced:
+                threads = [threading.Thread(target=writer, args=(roll,))
+                           for roll in rolls]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=10)
+
+            self.assertFalse(errors)
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(len(replace_calls), 2)
+            self.assertEqual(len(set(replace_calls)), 2)
+            self.assertEqual(synced.call_count, 2)
+            with open(out_path, encoding="utf-8") as fh:
+                final = json.load(fh)
+            self.assertIn(final["writer"], ("one", "two"))
+            self.assertFalse([name for name in os.listdir(d)
+                              if name.endswith(".tmp")])
+
+    def test_legacy_cache_builds_once_for_concurrent_callers(self):
+        base = int(datetime(2026, 7, 6, 1, 0, 0,
+                            tzinfo=timezone.utc).timestamp())
+        with tempfile.TemporaryDirectory() as d:
+            raw = write_day(d, "20260706", [
+                sample(ts_at(base, 0), gpus=[gpu(0, 80)],
+                       procs=[proc(1, 0, "a")]),
+            ])
+            statsagg._LEGACY_REBUILD_CACHE.clear()
+            start = threading.Barrier(3)
+            results = []
+            errors = []
+            results_lock = threading.Lock()
+            real_build = statsagg.build_rollup
+
+            def reader():
+                try:
+                    start.wait(timeout=5)
+                    rebuilt = statsagg._legacy_rebuild(raw)
+                    with results_lock:
+                        results.append(rebuilt)
+                except Exception as exc:
+                    errors.append(exc)
+
+            with mock.patch.object(statsagg, "build_rollup",
+                                   wraps=real_build) as built:
+                threads = [threading.Thread(target=reader) for _ in range(3)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=10)
+            self.assertFalse(errors)
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(built.call_count, 1)
+            self.assertEqual(len(results), 3)
+            self.assertTrue(all(row == results[0] for row in results))
+
+    def test_concurrent_v1_queries_upgrade_safely(self):
+        """Simulate ThreadingHTTPServer cache misses for one old rollup."""
+        now = datetime(2026, 7, 7, 12, 0, 0, tzinfo=timezone.utc)
+        base = int(datetime(2026, 7, 6, 1, 0, 0,
+                            tzinfo=timezone.utc).timestamp())
+        with tempfile.TemporaryDirectory() as d:
+            raw = write_day(d, "20260706", [
+                sample(ts_at(base, 0), gpus=[{
+                    "i": 0, "util": 80, "mem": 10, "mem_total": 100}],
+                       procs=[proc(1, 0, "a")]),
+            ])
+            legacy = statsagg.build_rollup(raw)
+            legacy["v"] = 1
+            legacy.pop("cluster", None)
+            with open(os.path.join(d, "rollup-20260706.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump(legacy, fh)
+
+            statsagg._LEGACY_REBUILD_CACHE.clear()
+            real_rebuild = statsagg._legacy_rebuild
+            real_build = statsagg.build_rollup
+            after_rebuild = threading.Barrier(2)
+            results = []
+            errors = []
+            results_lock = threading.Lock()
+
+            def gated_rebuild(path):
+                rebuilt = real_rebuild(path)
+                # Make both requests observe the old rollup and reach their
+                # independent, unique-temp writes before either can publish.
+                after_rebuild.wait(timeout=5)
+                return rebuilt
+
+            def reader():
+                try:
+                    result = statsagg.query(d, days=2, now_fn=lambda: now)
+                    with results_lock:
+                        results.append(result)
+                except Exception as exc:
+                    errors.append(exc)
+
+            with mock.patch.object(statsagg, "build_rollup",
+                                   wraps=real_build) as built, \
+                    mock.patch.object(statsagg, "_legacy_rebuild",
+                                      side_effect=gated_rebuild):
+                threads = [threading.Thread(target=reader) for _ in range(2)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=10)
+
+            self.assertFalse(errors)
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(built.call_count, 1)
+            self.assertEqual(len(results), 2)
+            self.assertTrue(all(r["insights"]["has_device_telemetry"]
+                                for r in results))
+            with open(os.path.join(d, "rollup-20260706.json"),
+                      encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh)["v"], statsagg.ROLLUP_VERSION)
+            self.assertFalse([name for name in os.listdir(d)
+                              if name.endswith(".tmp")])
+
+
+class TestPulseRendering(unittest.TestCase):
+    def test_wide_ascii_and_narrow_pulse_hierarchy(self):
+        now = datetime(2026, 7, 7, 12, 0, 0, tzinfo=timezone.utc)
+        ybase = int(datetime(2026, 7, 6, 1, 0, 0,
+                             tzinfo=timezone.utc).timestamp())
+        tbase = int(datetime(2026, 7, 7, 1, 0, 0,
+                             tzinfo=timezone.utc).timestamp())
+
+        def device(util, mem):
+            return [{"i": 0, "util": util, "mem": mem,
+                     "mem_total": 100}]
+
+        with tempfile.TemporaryDirectory() as d:
+            write_day(d, "20260706", [
+                sample(ts_at(ybase, 0), gpus=device(10, 20),
+                       procs=[proc(1, 0, "yoonki")]),
+                sample(ts_at(ybase, 15), gpus=device(10, 20),
+                       procs=[proc(1, 0, "yoonki")]),
+            ])
+            write_day(d, "20260707", [
+                sample(ts_at(tbase, 0), gpus=device(90, 80),
+                       procs=[proc(1, 0, "yoonki"), proc(2, 0, "sangmin")]),
+                sample(ts_at(tbase, 15), gpus=device(90, 80),
+                       procs=[proc(1, 0, "yoonki"), proc(2, 0, "sangmin")]),
+            ])
+            result = statsagg.query(d, days=2, now_fn=lambda: now)
+
+        wide = statsagg.render_stats_text(result, width=100,
+                                           unicode_ok=True)
+        self.assertIn("Cluster pulse", wide)
+        self.assertIn("UTIL mix", wide)
+        self.assertIn("Flow", wide)
+        self.assertIn("Momentum", wide)
+        self.assertIn("yoonki", wide)
+
+        ascii_text = statsagg.render_stats_text(result, width=100,
+                                                 unicode_ok=False)
+        self.assertIn("KST  UTIL", ascii_text)
+        self.assertNotIn("▁", ascii_text)
+        narrow = statsagg.render_stats_text(result, width=45,
+                                             unicode_ok=False)
+        self.assertIn("Cluster pulse", narrow)
+        self.assertIn("util", narrow)
+
+
 class TestMergeEqualsConcat(unittest.TestCase):
     def test_merge_two_days_equals_build_over_concat(self):
         # The two groups are contiguous (group 2 starts exactly one interval
@@ -174,6 +736,8 @@ class TestMergeEqualsConcat(unittest.TestCase):
             pc = write_day(d, "20260709", day1 + day2)
             concat = statsagg.build_rollup(pc)
 
+        self.assertIsInstance(merged["samples"], int)
+        self.assertEqual(merged["samples"], concat["samples"])
         self.assertAlmostEqual(merged["coverage_seconds"],
                                concat["coverage_seconds"], places=5)
         for owner in ("a", "b"):
@@ -375,6 +939,12 @@ class TestDailySeries(unittest.TestCase):
         # daily owners restricted to "a" only.
         for e in result["daily"]:
             self.assertEqual(list(e["owners"].keys()), ["a"])
+        # Device telemetry is cluster-wide, so an owner-filtered response must
+        # not present it as the owner's pulse or leak it through JSON/render.
+        self.assertFalse(result["insights"]["has_device_telemetry"])
+        self.assertEqual(result["telemetry_dates_covered"], [])
+        self.assertEqual(result["merged"]["cluster"]["util_weight"], 0.0)
+        self.assertNotIn("Cluster pulse", statsagg.render_stats_text(result))
 
     def test_query_backward_compatible_keys(self):
         now = datetime(2026, 7, 7, 12, 0, 0, tzinfo=timezone.utc)
@@ -864,6 +1434,43 @@ class TestLabMerge(unittest.TestCase):
         self.assertEqual([e["date"] for e in lab["daily"]],
                          ["20260706", "20260707"])
         self.assertEqual(lab["dates_covered"], ["20260706", "20260707"])
+
+    def test_partial_telemetry_uses_node_days_not_date_union(self):
+        local, peer, _lab = self._merge()
+        # Both nodes have the same date, but node-01's retained v1 history
+        # has no device telemetry.  A date set alone would incorrectly render
+        # this as complete 1/1 coverage.
+        peer["merged"]["cluster"] = statsagg._empty_cluster()
+        peer["telemetry_dates_covered"] = []
+        peer["insights"]["telemetry_dates_covered"] = []
+        peer["insights"]["telemetry_coverage"] = {
+            "covered": 0, "available": 1, "unit": "days"}
+        lab = statsagg.merge_query_results([("node-02", local),
+                                            ("node-01", peer)])
+        coverage = lab["insights"]["telemetry_coverage"]
+        self.assertEqual(coverage,
+                         {"covered": 1, "available": 2,
+                          "unit": "node-days"})
+        text = statsagg.render_stats_text(lab, color=False)
+        self.assertIn("partial telemetry: 1/2 node-days", text)
+
+    def test_lab_flow_is_explicit_per_node_and_hides_if_metadata_is_old(self):
+        local, peer, lab = self._merge()
+        self.assertTrue(lab["insights"]["has_flow"])
+        self.assertEqual(lab["insights"]["flow_scope"], "node")
+        text = statsagg.render_stats_text(lab, color=False)
+        self.assertIn("node compute windows", text)
+        self.assertIn("longest", text)
+        self.assertIn("per-node", text)
+
+        # A retained pre-boundary v2 rollup does not have enough information
+        # to promise even a per-node Flow count, so that line stays hidden.
+        peer["merged"]["cluster"].pop("flow_first_state")
+        incomplete = statsagg.merge_query_results([("node-02", local),
+                                                    ("node-01", peer)])
+        self.assertFalse(incomplete["insights"]["has_flow"])
+        self.assertNotIn("Flow      ",
+                         statsagg.render_stats_text(incomplete, color=False))
 
     def test_awards_recomputed_over_merged_owners(self):
         # node-02 alone: sujin is the power user (most GPU-h locally).

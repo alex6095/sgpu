@@ -13,6 +13,7 @@ namespace is used.
 import argparse
 import json
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -381,57 +382,347 @@ def _emit_update_notice(namespace, pod, no_color):
 # shell is left spewing mouse escape codes.
 _TERM_RESTORE = ("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"
                  "\x1b[?25h\x1b[?1049l")
-_RECONNECT_TRIES = 5
-_POD_WAIT_SECONDS = 60
+_MAX_CONSECUTIVE_RECONNECTS = 5
+# Five rapid reconnects trigger a capped recovery mode, rather than a process
+# lifetime limit. The recovery window bounds an actual control-plane outage.
+_STABLE_SESSION_SECONDS = 30
+# ``tui.py`` deliberately exits 75 after 45s of unread output.  Treating that
+# timeout as a normal 30s stable session would extend recovery forever, while
+# treating every 75 forever as unstable would strand a genuinely long-running
+# recovered session.  This threshold separates the default stall timeout from
+# a session that demonstrably delivered output for a meaningful interval.
+_WATCHDOG_STABLE_SESSION_SECONDS = 90
+_RECONNECT_RECOVERY_WINDOW_SECONDS = 300
+_POD_STATUS_TIMEOUT_SECONDS = 5
+_HEALTH_TIMEOUT_SECONDS = 8
+_RECONNECT_INITIAL_DELAY_SECONDS = 1
+_RECONNECT_MAX_DELAY_SECONDS = 16
+_RECONNECT_JITTER_FRACTION = 0.20
+
+# These errors cannot be repaired by reconnecting. Check them before pod
+# state because an RBAC failure also prevents ``kubectl get pod`` from
+# observing that state.
+_PERMANENT_EXEC_ERROR_MARKERS = (
+    "forbidden",
+    "unauthorized",
+    "permission denied",
+    "you must be logged in",
+    "provide credentials",
+    "executable file not found",
+    "no such file or directory",
+    "unknown command",
+)
+_TRANSPORT_ERROR_MARKERS = (
+    "unexpected eof",
+    "connection reset",
+    "connection closed",
+    "stream error",
+    "http2",
+    "websocket",
+    "spdy",
+    "tls handshake timeout",
+    "i/o timeout",
+    "context deadline exceeded",
+)
+
+
+def _pod_state(namespace, pod):
+    """Return the monitor lifecycle state without raising on a bad cluster.
+
+    A phase of ``Running`` is not enough to safely reconnect: Kubernetes can
+    report it while the container is terminating, restarting, or not Ready.
+    The UID catches a replacement pod during a rollout and restart_count
+    catches a monitor-container restart in the same pod.
+    """
+    state = {
+        "uid": None,
+        "phase": None,
+        "ready": False,
+        "restart_count": 0,
+        "error": None,
+    }
+    try:
+        result = subprocess.run(
+            ["kubectl", "get", "pod", pod, "-n", namespace, "-o", "json"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=_POD_STATUS_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        state["error"] = "%s: %s" % (type(exc).__name__, exc)
+        return state
+    if result.returncode != 0:
+        state["error"] = (result.stderr or result.stdout or
+                          "kubectl get pod exited %d" % result.returncode).strip()
+        return state
+    try:
+        payload = json.loads(result.stdout)
+    except (TypeError, ValueError) as exc:
+        state["error"] = "invalid kubectl pod JSON: %s" % exc
+        return state
+
+    metadata = payload.get("metadata") or {}
+    status = payload.get("status") or {}
+    state["uid"] = metadata.get("uid")
+    state["phase"] = status.get("phase")
+    for condition in status.get("conditions") or []:
+        if condition.get("type") == "Ready":
+            state["ready"] = (
+                state["phase"] == "Running"
+                and condition.get("status") == "True"
+                and not metadata.get("deletionTimestamp"))
+            break
+    for container in status.get("containerStatuses") or []:
+        try:
+            state["restart_count"] += int(container.get("restartCount", 0))
+        except (TypeError, ValueError):
+            pass
+    return state
 
 
 def _pod_running(namespace, pod):
-    result = subprocess.run(
-        ["kubectl", "get", "pod", pod, "-n", namespace,
-         "-o", "jsonpath={.status.phase}"],
-        capture_output=True, text=True)
-    return result.returncode == 0 and result.stdout.strip() == "Running"
+    """Compatibility helper for callers/tests that only need readiness."""
+    return _pod_state(namespace, pod)["ready"]
+
+
+def _pod_restarted_or_recreated(before, after):
+    if not before or not after:
+        return False
+    if before.get("uid") and after.get("uid") \
+            and before["uid"] != after["uid"]:
+        return True
+    return after.get("restart_count", 0) > before.get("restart_count", 0)
+
+
+def _pod_not_found(state):
+    if not state:
+        return False
+    text = (state.get("error") or "").lower()
+    return "notfound" in text or "not found" in text
+
+
+def _is_interrupt_exit(code):
+    # POSIX uses -SIGINT for a signalled child; Windows can expose the raw
+    # STATUS_CONTROL_C_EXIT value. KeyboardInterrupt is handled separately.
+    return code in (130, -2, -1073741510, 3221225786)
+
+
+def _is_permanent_exec_failure(stderr_text):
+    lowered = (stderr_text or "").lower()
+    return any(marker in lowered for marker in _PERMANENT_EXEC_ERROR_MARKERS)
+
+
+def _failure_diagnostics(stderr_text, pod_state):
+    return "\n".join(part for part in (
+        stderr_text, (pod_state or {}).get("error")) if part)
+
+
+def _is_transport_failure(stderr_text):
+    lowered = (stderr_text or "").lower()
+    return any(marker in lowered for marker in _TRANSPORT_ERROR_MARKERS) \
+        or not lowered.strip()
+
+
+def _is_retryable_exec_failure(before, after, stderr_text,
+                               tui_watchdog_exit=False):
+    """Separate pod/transport loss from an in-pod command failure."""
+    diagnostics = _failure_diagnostics(stderr_text, after)
+    if _is_permanent_exec_failure(diagnostics):
+        return False
+    # A disappearance after a known pod can be an update rollout. A pod that
+    # was absent before the session cannot be repaired by reconnecting.
+    if _pod_not_found(after) and not (before or {}).get("uid"):
+        return False
+    if not after.get("ready") or _pod_restarted_or_recreated(before, after):
+        return True
+    if tui_watchdog_exit and (
+            "command terminated with exit code 75"
+            in diagnostics.lower()):
+        return True
+    # kubectl reports a non-zero exit from tui.py this way. If the exact same
+    # monitor is still Ready, reconnecting just starts the same crashing command
+    # five times and hides its useful diagnostic.
+    if "command terminated with exit code" in diagnostics.lower():
+        return False
+    return _is_transport_failure(diagnostics)
+
+
+def _is_tui_watchdog_exit(code, stderr_text, enabled=False):
+    """True only for tui.py's deliberate unread-output watchdog exit."""
+    return (enabled and code == 75
+            and "command terminated with exit code 75"
+            in (stderr_text or "").lower())
+
+
+def _interactive_exec(command):
+    """Run kubectl with the TUI attached and retain its terminal diagnostic.
+
+    stdout/stdin deliberately inherit the terminal, preserving ``kubectl exec
+    -it``. Capturing only stderr lets the caller classify an EOF/RBAC/remote
+    command exit while subprocess.run() still drains the pipe and reaps the
+    child on every path.
+    """
+    try:
+        result = subprocess.run(
+            command, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+            errors="replace")
+    except KeyboardInterrupt:
+        return 130, ""
+    stderr_text = result.stderr or ""
+    if stderr_text:
+        sys.stderr.write(stderr_text)
+        sys.stderr.flush()
+    return result.returncode, stderr_text
+
+
+def _monitor_healthy(namespace, pod):
+    """Whether the in-pod server has bound /health after a reconnection."""
+    try:
+        result = subprocess.run(
+            ["kubectl", "exec", "-n", namespace, pod, "--", "curl", "-sS",
+             "--max-time", "3", "-o", "/dev/null", "-w", "%{http_code}",
+             "http://127.0.0.1:8080/health"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=_HEALTH_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    # 503 is a *degraded GPU data source*, not an unavailable HTTP server. The
+    # TUI can still display its diagnostic, so it is safe to attach to it.
+    return result.returncode == 0 and result.stdout.strip() in ("200", "503")
+
+
+def _wait_for_ready_pod(namespace, pod, require_health=False,
+                        timeout=_RECONNECT_RECOVERY_WINDOW_SECONDS):
+    """Wait a bounded amount of time for a Ready (and optionally healthy) pod."""
+    deadline = time.monotonic() + timeout
+    delay = _RECONNECT_INITIAL_DELAY_SECONDS
+    while True:
+        state = _pod_state(namespace, pod)
+        now = time.monotonic()
+        if state["ready"] and not require_health:
+            return state
+        if state["ready"] and _monitor_healthy(namespace, pod):
+            return state
+        remaining = deadline - now
+        if remaining <= 0:
+            return None
+        time.sleep(min(delay, remaining))
+        delay = min(_RECONNECT_MAX_DELAY_SECONDS, delay * 2)
+
+
+def _reconnect_delay(consecutive_failures, random_value=None):
+    """Bounded exponential backoff with small jitter for concurrent clients."""
+    exponent = min(20, max(0, consecutive_failures - 1))
+    base = min(_RECONNECT_MAX_DELAY_SECONDS,
+               _RECONNECT_INITIAL_DELAY_SECONDS * (2 ** exponent))
+    if random_value is None:
+        random_value = random.random()
+    jitter = 1 + _RECONNECT_JITTER_FRACTION * (2 * random_value - 1)
+    return min(_RECONNECT_MAX_DELAY_SECONDS, base * jitter)
 
 
 def _interactive(namespace, pod, pod_command, no_color):
     if not (sys.stdout.isatty() and sys.stdin.isatty()):
         _print(_fetch(namespace, pod, "/table?color=0&" + _cols_param()))
         return 0
-    attempts = 0
+    consecutive_failures = 0
+    try:
+        pod_before = _pod_state(namespace, pod)
+    except KeyboardInterrupt:
+        return 130
+    # Do not launch an interactive child when the lifecycle probe has already
+    # established a permanent problem.  Besides producing a clearer error,
+    # this is important for least-privileged kubeconfigs: a denied ``get`` or
+    # a known-missing pod must not be followed by a needless ``pods/exec``.
+    initial_diagnostics = _failure_diagnostics("", pod_before)
+    if (_pod_not_found(pod_before)
+            or _is_permanent_exec_failure(initial_diagnostics)):
+        _hint_on_failure(namespace, pod, initial_diagnostics)
+        return 1
+    require_health = "tui.py" in pod_command
+    recovery_started_at = None
     while True:
-        try:
-            code = subprocess.call(
-                ["kubectl", "exec", "-it", "-n", namespace, pod, "--"]
-                + pod_command)
-        except KeyboardInterrupt:
-            code = 130
+        started_at = time.monotonic()
+        code, stderr_text = _interactive_exec(
+            ["kubectl", "exec", "-it", "-n", namespace, pod, "--"]
+            + pod_command)
         if code == 0:
             return 0
-        # Abnormal end (137 = the in-pod process was SIGKILLed, e.g. the
-        # monitor pod was recreated for an update). First un-wedge the
-        # local terminal, then try to come back once the pod is Ready.
         sys.stdout.write(_TERM_RESTORE)
         sys.stdout.flush()
-        if code == 130:
+        if _is_interrupt_exit(code):
             return code
-        attempts += 1
-        if attempts > _RECONNECT_TRIES:
-            print("sgpu: connection lost %d times; giving up (exit %d)"
-                  % (attempts - 1, code), file=sys.stderr)
+
+        try:
+            pod_after = _pod_state(namespace, pod)
+        except KeyboardInterrupt:
+            return 130
+        if not _is_retryable_exec_failure(
+                pod_before, pod_after, stderr_text,
+                tui_watchdog_exit=require_health):
+            diagnostics = _failure_diagnostics(stderr_text, pod_after)
+            if (_pod_not_found(pod_after)
+                    or _is_permanent_exec_failure(diagnostics)):
+                _hint_on_failure(namespace, pod, diagnostics)
+            else:
+                print("sgpu: monitor session failed without a recoverable pod "
+                      "or transport interruption (exit %d); not reconnecting"
+                      % code, file=sys.stderr)
             return code
-        print("sgpu: session ended unexpectedly (exit %d) — the monitor pod "
-              "probably restarted for an update. Reconnecting..."
-              % code, file=sys.stderr)
-        waited = 0
-        while waited < _POD_WAIT_SECONDS:
-            if _pod_running(namespace, pod):
-                break
-            time.sleep(2)
-            waited += 2
+
+        # The budget covers only a burst of failures. A session that stayed
+        # healthy for this long proved that the transport works, so an update
+        # hours later starts a fresh budget instead of inheriting old blips.
+        # A remote-output watchdog is different: its 45s no-progress timeout
+        # necessarily exceeds the normal stable threshold.  Repeated default
+        # watchdog exits retain the original five-minute deadline, but a
+        # genuinely long recovered session gets a fresh budget even if it
+        # eventually ends through the watchdog path.
+        ended_at = time.monotonic()
+        watchdog_exit = _is_tui_watchdog_exit(
+            code, stderr_text, enabled=require_health)
+        stable_threshold = (_WATCHDOG_STABLE_SESSION_SECONDS
+                            if watchdog_exit else _STABLE_SESSION_SECONDS)
+        if ended_at - started_at >= stable_threshold:
+            consecutive_failures = 0
+            recovery_started_at = None
+        if recovery_started_at is None:
+            recovery_started_at = ended_at
+        recovery_deadline = (
+            recovery_started_at + _RECONNECT_RECOVERY_WINDOW_SECONDS)
+        consecutive_failures += 1
+        if (consecutive_failures > _MAX_CONSECUTIVE_RECONNECTS
+                and ended_at >= recovery_deadline):
+            print("sgpu: recovery window expired after %d unstable "
+                  "connections; giving up (exit %d)"
+                  % (consecutive_failures - 1, code), file=sys.stderr)
+            return code
+
+        rollout = _pod_restarted_or_recreated(pod_before, pod_after)
+        try:
+            ready_state = _wait_for_ready_pod(
+                namespace, pod, require_health=require_health,
+                timeout=max(0.0, recovery_deadline - time.monotonic()))
+        except KeyboardInterrupt:
+            return 130
+        if ready_state is None:
+            _hint_on_failure(namespace, pod,
+                             "pod was not Ready/healthy before reconnect")
+            return code
+        reason = "monitor pod changed" if rollout else "transport ended"
+        delay = _reconnect_delay(consecutive_failures)
+        if consecutive_failures <= _MAX_CONSECUTIVE_RECONNECTS:
+            progress = "attempt %d/%d" % (
+                consecutive_failures, _MAX_CONSECUTIVE_RECONNECTS)
         else:
-            _hint_on_failure(namespace, pod, "pod did not return to Running")
-            return code
-        time.sleep(1)  # let the server inside come up
+            remaining = max(0, int(recovery_deadline - time.monotonic()))
+            progress = "extended recovery; %ds left" % remaining
+        print("sgpu: %s unexpectedly (exit %d); reconnecting in %ss "
+              "(%s)..."
+              % (reason, code, delay, progress), file=sys.stderr)
+        try:
+            time.sleep(delay)
+        except KeyboardInterrupt:
+            return 130
+        pod_before = ready_state
 
 
 def _watch(namespace, pod, seconds, no_color):

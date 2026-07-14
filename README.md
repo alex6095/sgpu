@@ -13,8 +13,9 @@ another Kubernetes pod.
   node with `sgpu -n 1` / `sgpu -n 2`.
 - **In-pod TUI** via `kubectl exec -it`: smooth refresh, scrolling, sorting,
   owner filtering, and a stats screen.
-- **Usage stats 24/7**: per-owner GPU-hours, awards, KST activity heatmaps,
-  and idle-allocation warnings.
+- **Usage stats 24/7**: a cluster pulse (KST utilization/VRAM sparklines,
+  utilization zones, observed compute windows), owner momentum, GPU-hours,
+  awards, heatmaps, and idle-allocation warnings.
 - Shared **storage (pv-01/pv-02) usage** at a glance.
 - Monitor pod is read-only, always-on, and requests **no GPU**.
 
@@ -146,12 +147,35 @@ Text endpoints support `?color=1&cols=N&ascii=1`.
 SGPU samples every 60 seconds around the clock into raw JSONL, gzips and rolls
 up daily summaries, and stores the results on the shared volume at
 `pv-01/sangmin/sgpu` (~0.1 MB/day/node gzipped). The interval is set by
-`SGPU_SAMPLE_INTERVAL`; the aggregator infers each day's interval, so
-changing it never breaks historical stats.
+`SGPU_SAMPLE_INTERVAL`; the aggregator preserves a compatible daily median
+while recognizing confirmed sustained cadence changes within a day, so even a
+large 15-second to 900-second switch neither under-credits normal samples nor
+fragments Flow. Missing telemetry remains bounded and breaks a Flow window.
 
-Retention defaults to 365 days and is capped at 2 GB. `sgpu stats 30` shows
-the [leaderboard, awards](#leaderboard--awards), daily activity, and KST hour
-heatmaps.
+Retention defaults to 365 days and is capped at 2 GB. `sgpu stats 30` starts
+with a **Cluster pulse**: compact KST utilization and VRAM sparklines, a
+quiet/light/work/hot utilization-zone distribution, and observed compute
+windows. It then shows the [leaderboard, awards](#leaderboard--awards), owner
+momentum, daily activity, and KST hour heatmaps. The curses stats screen keeps
+the pulse above the leaderboard/grid; on a short terminal it drops awards
+before it drops the pulse or grid.
+
+Device telemetry is derived from the `util`, `mem`, and `mem_total` fields
+already recorded in raw sample v1. Daily rollup v2 stores only weighted sums,
+24 KST buckets, ten utilization buckets, and window counters, so rendering
+does not re-scan raw history. On first access, an older rollup is rebuilt once
+from its preserved raw/gz file and atomically replaced. If raw history has
+already been removed, its owner totals remain valid but the pulse marks
+partial coverage (by **node-day** in LAB scope, so a same-date peer cannot
+mask a missing node) or stays hidden when no device telemetry is available,
+rather than treating unknown time as 0% utilization. Contiguous Flow windows
+are stitched across UTC rollup boundaries. A multi-node LAB pulse labels its
+exact aggregate as **node compute windows** and **longest per-node window**;
+it does not present that as a global cross-node time-window union.
+
+The pulse is cluster-wide telemetry, not a per-owner estimate. Therefore an
+owner-filtered `/stats?owner=...` result intentionally omits it; use that view
+for the owner's GPU-hours, efficiency, streak, and allocations.
 
 > The monitor pod must stay running for stats to accumulate. It is designed to
 > do that with tini init, `restartPolicy: Always`, and no GPU allocation.
@@ -164,6 +188,12 @@ by GPU-hours and hands out playful badges. Example:
 ```text
 SGPU usage report — last 7 days — all nodes (node-01+node-02)
 data: 7 days, coverage 168.0h
+
+Cluster pulse
+KST  UTIL ▁▁▂▃▄▆▇█▇▆▄▃▂▂▃▄▆▇▆▄▃▂▁▁  avg 54%  hot 31%
+     VRAM ▁▂▂▃▄▅▆▇▇▆▅▄▃▃▄▅▆▇▇▆▄▃▂▁  avg 47%
+UTIL mix  quiet 23%  light 18%  work 28%  hot 31%
+Flow      12 node compute windows · longest 9h18m per-node (any GPU >= 50%)
 
 Awards
 🏆 Best researcher: jiwon    — 92.4 effective GPU-h (81% avg over 114.1 GPU-h)
@@ -181,6 +211,9 @@ Leaderboard
 3.  minseo   node-02   40.2   39.0       97         97      62.9     40.2     0.0      0
 4.  haeun    node-01   37.9   27.2       72         72     139.7     39.4     1.6      4
 5.  taemin   node-01   11.6    0.1        7         25     139.0     21.4     9.8     46
+
+Momentum
+jiwon 7d streak · 7/7d · 81% eff  |  minseo 5d streak · 6/7d · 97% eff
 ```
 
 Ranking is by **GPU-H** (GPU-hours). Each owner holds **at most 3** badges.
@@ -217,6 +250,9 @@ Press `?` in the TUI for this same reference in-app.
 | `EFF-H` | Effective GPU-hours = `GPU-H × avg util` (compute actually done, not just held). |
 | `ALLOC-H` | Allocated GPU-hours from pods' `nvidia.com/gpu` requests. |
 | `IDLE-H` / `IDLE%` | Allocated but no process running — a wasted reservation. |
+| `Cluster pulse` | Device-level (not owner-attributed) KST utilization and VRAM rhythm. `UTIL mix` is weighted GPU time in quiet 0–9%, light 10–39%, work 40–69%, and hot 70–100% zones. |
+| `Flow` | Contiguous **observed** windows in one node's telemetry where any sampled GPU was at least 50% utilized; it is a cadence signal, not job-start accounting. Missing telemetry breaks a window. In LAB scope, `node compute windows` is the exact sum of per-node windows and `longest per-node` is their maximum — neither claims a global cross-node time union. |
+| `Momentum` | Each owner's active-day count, current streak, and effective-utilization profile over **observed days only**, so a monitor outage is not counted as personal inactivity. |
 | `REQ` / `ACT` | (pods table) GPUs a pod requested vs. actively using right now. |
 | `POWER` / `TEMP` | Power draw / cap, and temperature. |
 | `STORAGE` | Shared `pv-01`/`pv-02` volume usage (used / total / free). |
@@ -297,9 +333,13 @@ Known limits: pods overriding `spec.hostname` and MPS may show as `?`.
 Troubleshooting:
 
 ```text
-TUI died with exit 137            -> the monitor pod was recreated (usually an
-                                     update rollout); sgpu >=0.7.3 restores the
-                                     terminal and reconnects by itself
+TUI reconnects after an EOF       -> sgpu checks the actual pod UID/Ready state
+                                     and server health; a transient stream loss
+                                     uses bounded backoff instead of assuming a
+                                     rollout
+disconnected TUI left in the pod  -> current monitor images stop it after 45s
+                                     without terminal-output progress, avoiding
+                                     orphan polling processes
 broken terminal after dropped TUI -> reset (older clients)
 frozen TUI                         -> rerun sgpu
 garbled bars                       -> Windows Terminal or --no-color

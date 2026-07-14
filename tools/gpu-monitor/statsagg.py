@@ -12,23 +12,58 @@ Invariants
   a single build over the concatenated raw. Averages are computed only at
   render time.
 - Bounded credit: time credit per sample is dt = min(gap_to_previous,
-  2 * interval_hint) so a monitor outage never over-credits a single sample.
-  interval_hint is the median gap within the day (fallback 15s); the first
-  sample of a day gets dt = interval_hint.
+  2 * local_cadence) so a monitor outage never over-credits a single sample.
+  local_cadence follows confirmed, sustained within-day cadence changes while
+  ``interval_hint`` remains the historical daily median (fallback 15s).
 - KST is UTC+9 fixed (no DST).
+- Rollup compatibility: a v1 rollup is used for owner statistics, but when
+  its preserved raw file is available it is lazily rebuilt to v2 before any
+  cluster telemetry is shown.  If raw history has already expired, pulse
+  fields stay absent rather than pretending missing telemetry was 0%.
 """
 
 import gzip
 import json
 import os
+import tempfile
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 
 
 DEFAULT_INTERVAL_HINT = 15
+# A cadence change is only accepted after three adjacent, similar gaps.  This
+# is deliberately small enough to recognize a sampler changing 15 -> 60s
+# promptly, while rejecting one missed sample or a short collector stall.
+CADENCE_TRANSITION_CONFIRMATIONS = 3
+CADENCE_MATCH_TOLERANCE = 0.25
+CADENCE_SLOW_RATIO = 2.0
+CADENCE_FAST_RATIO = 0.5
 KST_OFFSET_HOURS = 9
 NONE_OWNER = "?"
 SPARK = "▁▂▃▄▅▆▇█"  # ▁▂▃▄▅▆▇█
+
+# Rollup v2 adds cluster-level device telemetry.  It is intentionally derived
+# from the GPU fields that v1 samples already recorded, rather than changing
+# the sampler or keeping a second high-volume time series.  The ten buckets
+# preserve enough shape for a useful utilization profile without making daily
+# rollups large.
+ROLLUP_VERSION = 2
+UTIL_BUCKET_SIZE = 10
+UTIL_BUCKETS = 10
+BUSY_UTIL_THRESHOLD = 50
+
+# A read-only stats volume cannot accept the lazy v1 -> v2 rewrite.  Keep the
+# freshly rebuilt value in-process, keyed by source file metadata, so requests
+# do not repeatedly decompress the same historical raw file.  The server's
+# short query cache handles the common path too; this is the safe fallback.
+_LEGACY_REBUILD_CACHE = {}
+_LEGACY_REBUILD_CACHE_MAX = 512
+_LEGACY_REBUILD_CACHE_LOCK = threading.Lock()
+# POSIX permits simultaneous replacements of the same destination, whereas
+# Windows can transiently reject the second replace.  Temp-file creation and
+# JSON writes remain concurrent; only the final rename is serialized.
+_ROLLUP_REPLACE_LOCK = threading.Lock()
 
 # Calendar ("grass") cell glyphs, 5 levels (index 0 = empty).
 GRASS_UNICODE = " .░▒▓█"   # empty + . + 4 shades (level 5 uses █)
@@ -142,6 +177,58 @@ def _empty_owner():
     }
 
 
+def _empty_cluster():
+    """Accumulator for device telemetry, independent of process attribution.
+
+    ``device_seconds`` is the total time for which a GPU reported a numeric
+    utilization value.  Memory has its own weight because older records may
+    lack either ``mem`` or ``mem_total``.  The hourly arrays are KST, matching
+    the owner activity heatmap.
+
+    Busy/idle windows are deliberately conservative: a busy window means at
+    least one observed GPU was at or above BUSY_UTIL_THRESHOLD.  They describe
+    *observed* monitoring periods, not job starts, which makes them safe across
+    monitor outages and daily rollup boundaries.
+    """
+    return {
+        "device_seconds": 0.0,
+        "util_wsum": 0.0,
+        "util_weight": 0.0,
+        "mem_wsum": 0.0,
+        "mem_weight": 0.0,
+        "hour_util_wsum": [0.0] * 24,
+        "hour_util_weight": [0.0] * 24,
+        "hour_mem_wsum": [0.0] * 24,
+        "hour_mem_weight": [0.0] * 24,
+        "util_hist": [0.0] * UTIL_BUCKETS,
+        "busy_windows": 0,
+        "busy_seconds": 0.0,
+        "idle_windows": 0,
+        "idle_seconds": 0.0,
+        "longest_busy_seconds": 0.0,
+        "longest_idle_seconds": 0.0,
+        # Boundary metadata makes Flow a mergeable daily summary.  The
+        # counters above are additive, but a busy run crossing midnight must
+        # be collapsed once when adjacent rollups are merged.  These fields
+        # retain just the two edge runs, not a per-sample timeline.
+        "flow_first_state": None,
+        "flow_last_state": None,
+        "flow_leading_seconds": 0.0,
+        "flow_trailing_seconds": 0.0,
+        "flow_first_ts": None,
+        "flow_last_ts": None,
+        "flow_all_one_run": True,
+        "flow_complete": True,
+        # "device" means one node's any-GPU windows.  LAB merges cannot
+        # reconstruct a global time union from compact rollups, but can report
+        # an exact sum of per-node windows when every input is complete.
+        "flow_scope": "device",
+        # Count of rollup days that actually contained numeric device util.
+        # It is diagnostic only; query results carry the exact calendar dates.
+        "telemetry_days": 0,
+    }
+
+
 def _empty_pod():
     return {
         "owner": None,
@@ -156,7 +243,7 @@ def _empty_pod():
 
 def _empty_rollup(date_str=""):
     return {
-        "v": 1,
+        "v": ROLLUP_VERSION,
         "date": date_str,
         "samples": 0,
         "first_ts": None,
@@ -166,6 +253,7 @@ def _empty_rollup(date_str=""):
         "interval_hint": DEFAULT_INTERVAL_HINT,
         "node": None,
         "gpu_names": [],
+        "cluster": _empty_cluster(),
         "owners": {},
         "pods": {},
     }
@@ -173,26 +261,156 @@ def _empty_rollup(date_str=""):
 
 # --- core accounting --------------------------------------------------------
 
-def _infer_interval_hint(records):
-    """Median gap (seconds) between consecutive samples; fallback 15."""
-    ts = []
-    for rec in records:
-        e = _parse_ts(rec.get("ts"))
-        if e is not None:
-            ts.append(e)
-    ts.sort()
+def _median(values):
+    """Return the exact median of a non-empty numeric sequence."""
+    values = sorted(values)
+    n = len(values)
+    if n % 2:
+        return values[n // 2]
+    return (values[n // 2 - 1] + values[n // 2]) / 2.0
+
+
+def _interval_hint_from_timestamps(timestamps):
+    """Historical daily median gap, ignoring non-monotonic corrupt lines."""
     gaps = []
-    for i in range(1, len(ts)):
-        g = ts[i] - ts[i - 1]
-        if g > 0:
-            gaps.append(g)
+    prev_ts = None
+    for ts in timestamps:
+        if prev_ts is None:
+            prev_ts = ts
+            continue
+        if ts > prev_ts:
+            gaps.append(ts - prev_ts)
+            prev_ts = ts
     if not gaps:
         return DEFAULT_INTERVAL_HINT
-    gaps.sort()
-    n = len(gaps)
-    if n % 2:
-        return gaps[n // 2]
-    return (gaps[n // 2 - 1] + gaps[n // 2]) / 2.0
+    return _median(gaps)
+
+
+def _infer_interval_hint(records):
+    """Median gap (seconds) between samples; retained for v1 callers."""
+    timestamps = []
+    for rec in records:
+        epoch = _parse_ts(rec.get("ts"))
+        if epoch is not None:
+            timestamps.append(epoch)
+    return _interval_hint_from_timestamps(timestamps)
+
+
+def _similar_cadence(left, right):
+    """Whether two positive gaps plausibly describe the same cadence."""
+    if left <= 0 or right <= 0:
+        return False
+    ratio = left / right
+    return (1.0 - CADENCE_MATCH_TOLERANCE
+            <= ratio <= 1.0 + CADENCE_MATCH_TOLERANCE)
+
+
+def _transition_direction(gap, cadence):
+    """Return 1/-1 for a plausible slower/faster cadence, else None."""
+    if gap <= 0 or cadence <= 0:
+        return None
+    ratio = gap / cadence
+    if CADENCE_SLOW_RATIO < ratio:
+        return 1
+    if ratio < CADENCE_FAST_RATIO:
+        return -1
+    return None
+
+
+def _cadence_profile(timestamps, fallback):
+    """Return ``(initial_cadence, [(sample_index, cadence), ...])``.
+
+    The profile is calculated from the first pass' file-order timestamps.  A
+    segment starts at the *first* confirmed gap, allowing the second streaming
+    pass to credit all three confirming samples at their new cadence.  An
+    outlier never becomes a segment: it must be followed by two similar gaps.
+    There is intentionally no transition-size ceiling: a deliberate sampler
+    update may legally move from 15 seconds to many minutes.  The daily median
+    is not changed, preserving rollup compatibility and reporting.
+    """
+    initial = float(fallback)
+    current = None
+    segments = []
+    candidate = []  # [(sample index, gap)]
+    candidate_direction = None
+    bootstrap_clean = True
+    first_positive_index = None
+    prev_ts = None
+
+    for index, ts in enumerate(timestamps):
+        if prev_ts is None:
+            prev_ts = ts
+            continue
+        # A duplicate or out-of-order line must not manufacture a cadence
+        # change.  Retain the latest monotonic timestamp for the next gap.
+        if ts <= prev_ts:
+            continue
+        gap = ts - prev_ts
+        prev_ts = ts
+        if first_positive_index is None:
+            first_positive_index = index
+
+        if current is None:
+            # Bootstrap from any short stable run near the beginning.  Three
+            # matching gaps are the evidence; imposing an arbitrary ceiling
+            # would break a legitimate large SGPU_SAMPLE_INTERVAL change.
+            if not candidate or _similar_cadence(gap, candidate[-1][1]):
+                candidate.append((index, gap))
+            else:
+                candidate = [(index, gap)]
+                bootstrap_clean = False
+
+            if len(candidate) < CADENCE_TRANSITION_CONFIRMATIONS:
+                continue
+            observed = _median([entry[1] for entry in candidate])
+            start_index = candidate[0][0]
+            if (bootstrap_clean
+                    and start_index == first_positive_index):
+                # The file began with this cadence, so its first sample also
+                # deserves the matching initial credit.
+                initial = observed
+            else:
+                # Before a late stable run, preserve the legacy daily hint.
+                # From the run's first gap onwards, use its observed cadence.
+                segments.append((start_index, observed))
+            current = observed
+            candidate = []
+            candidate_direction = None
+            continue
+
+        direction = _transition_direction(gap, current)
+        if direction is None:
+            candidate = []
+            candidate_direction = None
+            continue
+        if (candidate and candidate_direction == direction
+                and _similar_cadence(gap, candidate[-1][1])):
+            candidate.append((index, gap))
+        else:
+            candidate = [(index, gap)]
+            candidate_direction = direction
+        if len(candidate) < CADENCE_TRANSITION_CONFIRMATIONS:
+            continue
+
+        observed = _median([entry[1] for entry in candidate])
+        segments.append((candidate[0][0], observed))
+        current = observed
+        candidate = []
+        candidate_direction = None
+
+    return initial, segments
+
+
+def _infer_cadence_profile(records):
+    """First-pass interval median plus file-order adaptive cadence segments."""
+    timestamps = []
+    for rec in records:
+        epoch = _parse_ts(rec.get("ts"))
+        if epoch is not None:
+            timestamps.append(epoch)
+    interval_hint = _interval_hint_from_timestamps(timestamps)
+    initial, segments = _cadence_profile(timestamps, interval_hint)
+    return interval_hint, initial, segments
 
 
 def _owner_of(proc):
@@ -200,6 +418,84 @@ def _owner_of(proc):
     if o is None:
         return NONE_OWNER
     return o
+
+
+def _number(value):
+    """Return a finite float for a numeric-ish value, else None.
+
+    Stats files are deliberately long-lived.  Be strict at the aggregation
+    boundary so a hand-edited, old, or partially-null record cannot poison a
+    whole rollup with a TypeError or a NaN.
+    """
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if out != out or out in (float("inf"), float("-inf")):
+        return None
+    return out
+
+
+def _percent(value):
+    value = _number(value)
+    if value is None:
+        return None
+    return max(0.0, min(100.0, value))
+
+
+def _accumulate_cluster(cluster, gpus, hour, dt, flow_state):
+    """Add one sample's device telemetry and return its flow state.
+
+    ``flow_state`` is ``(busy_bool, run_seconds)`` or ``None``.  It remains a
+    local build detail (not persisted), while the resulting windows and their
+    longest observed runs are persisted in the rollup.
+    """
+    utils = []
+    for g in gpus or []:
+        if not isinstance(g, dict):
+            continue
+        util = _percent(g.get("util"))
+        if util is not None:
+            utils.append(util)
+            cluster["device_seconds"] += dt
+            cluster["util_wsum"] += util * dt
+            cluster["util_weight"] += dt
+            cluster["hour_util_wsum"][hour] += util * dt
+            cluster["hour_util_weight"][hour] += dt
+            bucket = min(UTIL_BUCKETS - 1, int(util // UTIL_BUCKET_SIZE))
+            cluster["util_hist"][bucket] += dt
+
+        used = _number(g.get("mem"))
+        total = _number(g.get("mem_total"))
+        if used is not None and total is not None and total > 0:
+            mem_pct = max(0.0, min(100.0, 100.0 * used / total))
+            cluster["mem_wsum"] += mem_pct * dt
+            cluster["mem_weight"] += dt
+            cluster["hour_mem_wsum"][hour] += mem_pct * dt
+            cluster["hour_mem_weight"][hour] += dt
+
+    # Missing device telemetry is a gap, not an idle period.  Resetting the
+    # local state prevents a synthetic multi-hour "streak" through old/null
+    # records or a collector failure.
+    if not utils:
+        return None
+
+    busy = max(utils) >= BUSY_UTIL_THRESHOLD
+    if flow_state is not None and flow_state[0] == busy:
+        run_seconds = flow_state[1] + dt
+    else:
+        run_seconds = dt
+        cluster["busy_windows" if busy else "idle_windows"] += 1
+
+    if busy:
+        cluster["busy_seconds"] += dt
+        if run_seconds > cluster["longest_busy_seconds"]:
+            cluster["longest_busy_seconds"] = run_seconds
+    else:
+        cluster["idle_seconds"] += dt
+        if run_seconds > cluster["longest_idle_seconds"]:
+            cluster["longest_idle_seconds"] = run_seconds
+    return busy, run_seconds
 
 
 def build_rollup(day_path):
@@ -220,15 +516,23 @@ def _build_rollup(day_path, idle_options=None):
             return roll, []
         return roll
 
-    # Two passes: first infer the interval hint (median gap), then accumulate.
-    # Both stream; only timestamps are materialized by _infer_interval_hint.
-    interval_hint = _infer_interval_hint(_iter_records(day_path))
+    # Two passes: the first preserves the historical daily median and derives
+    # a compact file-order cadence profile; the second still streams the raw
+    # JSONL.  The existing exact median already materializes one day's
+    # timestamps, while the profile adds only confirmed segment boundaries.
+    interval_hint, initial_cadence, cadence_segments = _infer_cadence_profile(
+        _iter_records(day_path))
     roll["interval_hint"] = interval_hint
-    dt_cap = 2.0 * interval_hint
 
     gpu_names = set()
     owners = roll["owners"]
     pods = roll["pods"]
+    cluster = roll["cluster"]
+    cluster_flow = None
+    flow_first_state = None
+    flow_leading_seconds = 0.0
+    flow_leading_open = True
+    flow_all_one_run = True
     idle_seen = {}
     idle_proc_pods = set()
     if idle_options is not None:
@@ -241,24 +545,20 @@ def _build_rollup(day_path, idle_options=None):
         idle_window_start = None
 
     prev_ts = None
+    sample_index = -1
+    cadence_index = 0
+    local_cadence = initial_cadence
     for rec in _iter_records(day_path):
         ts = _parse_ts(rec.get("ts"))
         if ts is None:
             continue
-        if idle_options is not None and ts >= idle_window_start:
-            _scan_idle_record(rec, ts, idle_seen, idle_proc_pods)
-
-        if prev_ts is None:
-            dt = float(interval_hint)
-        else:
-            gap = ts - prev_ts
-            if gap < 0:
-                gap = 0.0
-            dt = min(gap, dt_cap)
-        prev_ts = ts
+        sample_index += 1
+        while (cadence_index < len(cadence_segments)
+               and sample_index >= cadence_segments[cadence_index][0]):
+            local_cadence = cadence_segments[cadence_index][1]
+            cadence_index += 1
 
         roll["samples"] += 1
-        roll["coverage_seconds"] += dt
         if roll["first_ts"] is None or ts < _parse_ts(roll["first_ts"]):
             roll["first_ts"] = rec.get("ts")
         if roll["last_ts"] is None or ts > _parse_ts(roll["last_ts"]):
@@ -266,18 +566,81 @@ def _build_rollup(day_path, idle_options=None):
         if roll["node"] is None and rec.get("node"):
             roll["node"] = rec.get("node")
 
-        # Index GPU device stats for this sample.
+        # Malformed chronological order has no elapsed interval to credit.
+        # In particular, do not move ``prev_ts`` backwards: a late old line
+        # must not inflate the following sample's dt or split its Flow run.
+        if prev_ts is not None and ts <= prev_ts:
+            continue
+        if idle_options is not None and ts >= idle_window_start:
+            _scan_idle_record(rec, ts, idle_seen, idle_proc_pods)
+
+        if prev_ts is None:
+            dt = float(local_cadence)
+            flow_gap = False
+        else:
+            gap = ts - prev_ts
+            dt_cap = 2.0 * local_cadence
+            # Capping credit prevents an outage from inflating usage.  The
+            # same gap is a Flow boundary: Flow is strictly an observed
+            # telemetry window, so missing telemetry must break it.
+            flow_gap = gap > dt_cap
+            dt = min(gap, dt_cap)
+        prev_ts = ts
+
+        roll["coverage_seconds"] += dt
+
+        # Index GPU device stats for this sample.  The cluster accumulator is
+        # intentionally fed before process attribution so un-attributed work
+        # remains visible in the cluster pulse.
         gpu_util = {}      # gpu index -> util (may be None)
         gpu_mem_total = {}
-        for g in rec.get("gpus", []) or []:
+        gpus = rec.get("gpus", []) or []
+        for g in gpus:
+            if not isinstance(g, dict):
+                continue
             gi = g.get("i")
             if gi is None:
                 continue
-            gpu_util[gi] = g.get("util")
-            if g.get("mem_total") is not None:
-                gpu_mem_total[gi] = g.get("mem_total")
+            # Keep the older owner accumulators just as defensive as the new
+            # cluster telemetry.  JSON permits NaN in Python's decoder and a
+            # historic hand-edited record must not poison a whole report.
+            gpu_util[gi] = _percent(g.get("util"))
+            mem_total = _number(g.get("mem_total"))
+            if mem_total is not None:
+                gpu_mem_total[gi] = mem_total
             if g.get("name"):
                 gpu_names.add(g.get("name"))
+
+        kst_hour = _kst_hour(ts)
+        previous_flow = cluster_flow
+        if flow_gap:
+            cluster_flow = None
+            previous_flow = None
+            if flow_first_state is not None:
+                flow_leading_open = False
+                flow_all_one_run = False
+        cluster_flow = _accumulate_cluster(
+            cluster, gpus, kst_hour, dt, cluster_flow)
+        if cluster_flow is None:
+            if previous_flow is not None and flow_first_state is not None:
+                flow_leading_open = False
+                flow_all_one_run = False
+        else:
+            flow_state, flow_run_seconds = cluster_flow
+            if flow_first_state is None:
+                flow_first_state = flow_state
+                flow_leading_seconds = flow_run_seconds
+                cluster["flow_first_ts"] = rec.get("ts")
+            else:
+                if (previous_flow is None
+                        or previous_flow[0] != flow_state):
+                    flow_leading_open = False
+                    flow_all_one_run = False
+                elif flow_leading_open:
+                    flow_leading_seconds = flow_run_seconds
+            cluster["flow_last_ts"] = rec.get("ts")
+            cluster["flow_last_state"] = flow_state
+            cluster["flow_trailing_seconds"] = flow_run_seconds
 
         # Group this sample's procs by owner and by pod.
         procs = rec.get("procs", []) or []
@@ -294,18 +657,20 @@ def _build_rollup(day_path, idle_options=None):
         owner_sm = {}
 
         for p in procs:
+            if not isinstance(p, dict):
+                continue
             owner = _owner_of(p)
             gi = p.get("gpu")
             owner_gpus.setdefault(owner, set())
             if gi is not None:
                 owner_gpus[owner].add(gi)
                 gpu_owners.setdefault(gi, set()).add(owner)
-                mem = p.get("mem")
+                mem = _number(p.get("mem"))
                 if mem is not None:
                     key = (owner, gi)
                     owner_gpu_mem[key] = owner_gpu_mem.get(key, 0) + mem
 
-            sm = p.get("sm")
+            sm = _percent(p.get("sm"))
             if sm is not None:
                 owner_sm.setdefault(owner, []).append(sm)
 
@@ -315,8 +680,9 @@ def _build_rollup(day_path, idle_options=None):
                                                  "owner": owner})
                 if gi is not None:
                     ps["gpus"].add(gi)
-                if p.get("mem") is not None:
-                    ps["mem"] += p.get("mem")
+                mem = _number(p.get("mem"))
+                if mem is not None:
+                    ps["mem"] += mem
 
         # Accumulate per owner.
         for owner, gset in owner_gpus.items():
@@ -352,8 +718,7 @@ def _build_rollup(day_path, idle_options=None):
                 acc["mem_peak_mib"] = sample_mem_peak
 
             # KST hour histogram weighted by active gpu-seconds.
-            hh = _kst_hour(ts)
-            acc["hour_hist_kst"][hh] += n_active * dt
+            acc["hour_hist_kst"][kst_hour] += n_active * dt
 
         # Per-pod accumulation (proc side).
         for pod, ps in pod_sample.items():
@@ -379,12 +744,14 @@ def _build_rollup(day_path, idle_options=None):
             alloc_running = {}   # owner -> summed running req
             running_count = {}   # owner -> count of running pods (gpu units)
             for r in pod_rows:
+                if not isinstance(r, dict):
+                    continue
                 if r.get("phase") != "Running":
                     continue
                 owner = r.get("owner")
                 if owner is None:
                     owner = NONE_OWNER
-                req = r.get("req") or 0
+                req = _number(r.get("req")) or 0
                 alloc_running[owner] = alloc_running.get(owner, 0) + req
                 running_count[owner] = running_count.get(owner, 0) + req
 
@@ -406,6 +773,11 @@ def _build_rollup(day_path, idle_options=None):
                 acc["idle_gpu_seconds"] += idle * dt
 
     roll["gpu_names"] = sorted(gpu_names)
+    cluster["flow_first_state"] = flow_first_state
+    cluster["flow_leading_seconds"] = flow_leading_seconds
+    cluster["flow_all_one_run"] = flow_all_one_run
+    if cluster["util_weight"] > 0:
+        cluster["telemetry_days"] = 1
     if idle_options is not None:
         return roll, _idle_rows(idle_seen, idle_proc_pods, idle_now,
                                 owner_filter)
@@ -431,17 +803,56 @@ def _date_from_path(path):
     return ""
 
 
-def write_rollup(day_path):
-    """Build a rollup for day_path and write rollup-YYYYMMDD.json beside it."""
-    roll = build_rollup(day_path)
+def _rollup_output_path(day_path, roll):
     date_str = roll.get("date") or _date_from_path(day_path)
     out_dir = os.path.dirname(os.path.abspath(day_path))
-    out_path = os.path.join(out_dir, "rollup-%s.json" % date_str)
-    tmp = out_path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(roll, fh, ensure_ascii=False)
-        fh.flush()
-    os.replace(tmp, out_path)
+    return os.path.join(out_dir, "rollup-%s.json" % date_str)
+
+
+def _write_rollup_file(out_path, roll):
+    """Atomically replace one rollup without sharing temp files between writers.
+
+    The stats HTTP server may lazy-upgrade the same v1 rollup from concurrent
+    requests.  Each writer owns a unique temp in the destination directory;
+    only its own completed file is ever renamed or cleaned up.  ``os.replace``
+    makes the final handoff atomic for readers on the same filesystem.
+    """
+    out_dir = os.path.dirname(os.path.abspath(out_path))
+    base = os.path.basename(out_path)
+    fd, tmp = tempfile.mkstemp(prefix=".%s." % base, suffix=".tmp", dir=out_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(roll, fh, ensure_ascii=False)
+            fh.flush()
+            # Make the new file durable before exposing it.  If fsync fails,
+            # retain the previous rollup rather than publishing a doubtful one.
+            os.fsync(fh.fileno())
+        with _ROLLUP_REPLACE_LOCK:
+            os.replace(tmp, out_path)
+    finally:
+        # os.replace removes our temp on success.  On a read-only volume or
+        # an interrupted rename, cleanup is best-effort and can only touch the
+        # unique path allocated above, never another request's temp file.
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+
+
+def _try_write_rollup(day_path, roll):
+    """Best-effort persistence for query-time compatibility upgrades."""
+    try:
+        _write_rollup_file(_rollup_output_path(day_path, roll), roll)
+        return True
+    except Exception:
+        return False
+
+
+def write_rollup(day_path):
+    """Build a rollup for day_path and atomically write it beside the raw."""
+    roll = build_rollup(day_path)
+    _write_rollup_file(_rollup_output_path(day_path, roll), roll)
     return roll
 
 
@@ -452,7 +863,13 @@ def _min_ts(a, b):
         return b
     if b is None:
         return a
-    return a if _parse_ts(a) <= _parse_ts(b) else b
+    a_epoch = _parse_ts(a)
+    b_epoch = _parse_ts(b)
+    if a_epoch is None:
+        return b
+    if b_epoch is None:
+        return a
+    return a if a_epoch <= b_epoch else b
 
 
 def _max_ts(a, b):
@@ -460,35 +877,198 @@ def _max_ts(a, b):
         return b
     if b is None:
         return a
-    return a if _parse_ts(a) >= _parse_ts(b) else b
+    a_epoch = _parse_ts(a)
+    b_epoch = _parse_ts(b)
+    if a_epoch is None:
+        return b
+    if b_epoch is None:
+        return a
+    return a if a_epoch >= b_epoch else b
+
+
+def _merge_cluster(dst, src):
+    """Merge a v2 cluster accumulator; silently accept v1/no-cluster input."""
+    if not isinstance(src, dict):
+        return
+    for key in ("device_seconds", "util_wsum", "util_weight", "mem_wsum",
+                "mem_weight", "busy_windows", "busy_seconds",
+                "idle_windows", "idle_seconds", "telemetry_days"):
+        value = _number(src.get(key))
+        if value is not None:
+            dst[key] += value
+    for key in ("longest_busy_seconds", "longest_idle_seconds"):
+        value = _number(src.get(key))
+        if value is not None and value > dst[key]:
+            dst[key] = value
+    for key in ("hour_util_wsum", "hour_util_weight", "hour_mem_wsum",
+                "hour_mem_weight", "util_hist"):
+        incoming = src.get(key) or []
+        if not isinstance(incoming, (list, tuple)):
+            continue
+        target = dst[key]
+        for i in range(min(len(target), len(incoming))):
+            value = _number(incoming[i])
+            if value is not None:
+                target[i] += value
 
 
 def _merge_owner(dst, src):
+    if not isinstance(src, dict):
+        return
     for key in ("gpu_seconds", "sm_wsum", "sm_weight", "util_wsum",
                 "util_weight", "mem_wsum", "mem_weight", "alloc_gpu_seconds",
                 "idle_gpu_seconds"):
-        dst[key] = dst.get(key, 0.0) + src.get(key, 0.0)
+        value = _number(src.get(key))
+        if value is not None:
+            dst[key] = (_number(dst.get(key)) or 0.0) + value
     for key in ("mem_peak_mib", "mem_total_mib"):
-        dst[key] = max(dst.get(key, 0), src.get(key, 0))
+        value = _number(src.get(key))
+        if value is not None:
+            dst[key] = max(_number(dst.get(key)) or 0.0, value)
     dh = dst.setdefault("hour_hist_kst", [0.0] * 24)
-    sh = src.get("hour_hist_kst", [0.0] * 24)
+    sh = src.get("hour_hist_kst") or []
+    if not isinstance(sh, (list, tuple)):
+        sh = []
     for i in range(24):
-        dh[i] = dh[i] + (sh[i] if i < len(sh) else 0.0)
+        incoming = _number(sh[i] if i < len(sh) else None)
+        if incoming is not None:
+            dh[i] = (_number(dh[i] if i < len(dh) else None) or 0.0) + incoming
 
 
 def _merge_pod(dst, src):
+    if not isinstance(src, dict):
+        return
     if dst.get("owner") is None:
         dst["owner"] = src.get("owner")
     dst["first_ts"] = _min_ts(dst.get("first_ts"), src.get("first_ts"))
     dst["last_ts"] = _max_ts(dst.get("last_ts"), src.get("last_ts"))
-    dst["max_gpus"] = max(dst.get("max_gpus", 0), src.get("max_gpus", 0))
-    dst["peak_mem_mib"] = max(dst.get("peak_mem_mib", 0),
-                              src.get("peak_mem_mib", 0))
-    dst["gpu_seconds"] = dst.get("gpu_seconds", 0.0) + src.get("gpu_seconds", 0.0)
-    dst["req"] = max(dst.get("req", 0), src.get("req", 0))
+    for key in ("max_gpus", "peak_mem_mib", "req"):
+        value = _number(src.get(key))
+        if value is not None:
+            dst[key] = max(_number(dst.get(key)) or 0.0, value)
+    value = _number(src.get("gpu_seconds"))
+    if value is not None:
+        dst["gpu_seconds"] = (_number(dst.get("gpu_seconds")) or 0.0) + value
 
 
-def merge_rollups(rollups):
+_FLOW_METADATA_KEYS = (
+    "flow_first_state", "flow_last_state", "flow_leading_seconds",
+    "flow_trailing_seconds", "flow_first_ts", "flow_last_ts",
+    "flow_all_one_run", "flow_complete",
+)
+
+
+def _rollup_has_flow_metadata(roll):
+    cluster = (roll or {}).get("cluster")
+    return isinstance(cluster, dict) and all(key in cluster
+                                             for key in _FLOW_METADATA_KEYS)
+
+
+def _flow_edge_is_contiguous(left, right):
+    """Whether two daily flow summaries touch without an observation gap."""
+    left_cluster = left.get("cluster") or {}
+    right_cluster = right.get("cluster") or {}
+    left_end = _parse_ts(left_cluster.get("flow_last_ts"))
+    right_start = _parse_ts(right_cluster.get("flow_first_ts"))
+    left_raw_end = _parse_ts(left.get("last_ts"))
+    right_raw_start = _parse_ts(right.get("first_ts"))
+    if None in (left_end, right_start, left_raw_end, right_raw_start):
+        return False
+    # Any raw sample after/before the final/initial telemetry sample is an
+    # explicit missing-telemetry boundary and must break a Flow run.
+    if abs(left_end - left_raw_end) > 1e-6 \
+            or abs(right_start - right_raw_start) > 1e-6:
+        return False
+    gap = right_start - left_end
+    if gap < 0:
+        return False
+    left_hint = _number(left.get("interval_hint")) or DEFAULT_INTERVAL_HINT
+    right_hint = _number(right.get("interval_hint")) or DEFAULT_INTERVAL_HINT
+    # A configuration change from 15s to 60s at midnight is still continuous;
+    # using the larger observed cadence avoids inventing a gap at that edge.
+    return gap <= 2.0 * max(left_hint, right_hint)
+
+
+def _copy_flow_boundary(cluster):
+    return {key: cluster.get(key) for key in _FLOW_METADATA_KEYS}
+
+
+def _stitch_flow_boundaries(out, rollups):
+    """Collapse equal-state runs that cross adjacent daily rollup boundaries.
+
+    ``merge_rollups`` is also used to add independent nodes for LAB scope. In
+    that case a union of time windows is unknowable from compact daily data,
+    so callers disable stitching and the Flow line is withheld.  Here the
+    ordered input is one node's calendar series, for which edge metadata is
+    sufficient and keeps the rollup compact.
+    """
+    target = out["cluster"]
+    known = all(_rollup_has_flow_metadata(roll) for roll in rollups)
+    if not known:
+        target["flow_complete"] = False
+        return
+
+    sequence = None
+    previous = None
+    for roll in rollups:
+        source = roll.get("cluster") or {}
+        if source.get("flow_first_state") is None:
+            # A no-telemetry day is a truthful gap between observed windows.
+            previous = None
+            if sequence is not None:
+                sequence["flow_all_one_run"] = False
+            continue
+        if sequence is None:
+            sequence = _copy_flow_boundary(source)
+            previous = roll
+            continue
+
+        touching = previous is not None and _flow_edge_is_contiguous(
+            previous, roll)
+        same_state = (touching
+                      and sequence.get("flow_last_state")
+                      == source.get("flow_first_state"))
+        if same_state:
+            state = source.get("flow_first_state")
+            window_key = "busy_windows" if state else "idle_windows"
+            target[window_key] = max(0.0, target.get(window_key, 0.0) - 1.0)
+            combined = ((_number(sequence.get("flow_trailing_seconds")) or 0.0)
+                        + (_number(source.get("flow_leading_seconds")) or 0.0))
+            longest_key = ("longest_busy_seconds" if state
+                           else "longest_idle_seconds")
+            target[longest_key] = max(target.get(longest_key, 0.0), combined)
+
+            prior_all_one = bool(sequence.get("flow_all_one_run"))
+            source_all_one = bool(source.get("flow_all_one_run"))
+            if prior_all_one:
+                sequence["flow_leading_seconds"] = (
+                    (_number(sequence.get("flow_leading_seconds")) or 0.0)
+                    + (_number(source.get("flow_leading_seconds")) or 0.0))
+            if source_all_one:
+                sequence["flow_trailing_seconds"] = combined
+            else:
+                sequence["flow_trailing_seconds"] = source.get(
+                    "flow_trailing_seconds")
+            sequence["flow_all_one_run"] = prior_all_one and source_all_one
+        else:
+            # Different state is a real transition; a missing/gapped edge is
+            # also a hard break even when both visible states happen to match.
+            sequence["flow_all_one_run"] = False
+            sequence["flow_trailing_seconds"] = source.get(
+                "flow_trailing_seconds")
+
+        sequence["flow_last_state"] = source.get("flow_last_state")
+        sequence["flow_last_ts"] = source.get("flow_last_ts")
+        previous = roll
+
+    if sequence is not None:
+        for key in _FLOW_METADATA_KEYS:
+            target[key] = sequence.get(key)
+    target["flow_complete"] = True
+    target["flow_scope"] = "device"
+
+
+def merge_rollups(rollups, stitch_flow=True):
     """Element-wise merge of a list of rollup dicts (sums add, peaks max).
 
     Returns a single merged rollup. Exposed for tests.
@@ -498,12 +1078,20 @@ def merge_rollups(rollups):
     dates = []
     gpu_names = set()
 
-    for roll in rollups:
-        if not roll:
-            continue
-        out["samples"] += roll.get("samples", 0)
-        out["coverage_seconds"] += roll.get("coverage_seconds", 0.0)
-        out["pods_coverage_seconds"] += roll.get("pods_coverage_seconds", 0.0)
+    usable_rollups = [roll for roll in rollups if isinstance(roll, dict)]
+    for roll in usable_rollups:
+        samples = _number(roll.get("samples"))
+        coverage = _number(roll.get("coverage_seconds"))
+        pods_coverage = _number(roll.get("pods_coverage_seconds"))
+        if samples is not None:
+            # Sample counts are an integer JSON field in every rollup/API
+            # version.  Sanitizing through float must not silently change the
+            # public shape to ``123.0``.
+            out["samples"] += int(max(0.0, samples))
+        if coverage is not None:
+            out["coverage_seconds"] += max(0.0, coverage)
+        if pods_coverage is not None:
+            out["pods_coverage_seconds"] += max(0.0, pods_coverage)
         out["first_ts"] = _min_ts(out["first_ts"], roll.get("first_ts"))
         out["last_ts"] = _max_ts(out["last_ts"], roll.get("last_ts"))
         if out["node"] is None and roll.get("node"):
@@ -513,21 +1101,41 @@ def merge_rollups(rollups):
         if roll.get("date"):
             dates.append(roll.get("date"))
 
-        for owner, acc in (roll.get("owners") or {}).items():
+        _merge_cluster(out["cluster"], roll.get("cluster"))
+
+        owners = roll.get("owners") or {}
+        if not isinstance(owners, dict):
+            owners = {}
+        for owner, acc in owners.items():
             dst = out["owners"].setdefault(owner, _empty_owner())
             _merge_owner(dst, acc)
 
-        for pod, pacc in (roll.get("pods") or {}).items():
+        pods = roll.get("pods") or {}
+        if not isinstance(pods, dict):
+            pods = {}
+        for pod, pacc in pods.items():
             dst = out["pods"].setdefault(pod, _empty_pod())
             _merge_pod(dst, pacc)
 
     out["gpu_names"] = sorted(gpu_names)
     # interval_hint of a merge is informational only; keep the last non-default.
-    hints = [r.get("interval_hint") for r in rollups
-             if r and r.get("interval_hint")]
+    hints = [_number(r.get("interval_hint")) for r in usable_rollups]
+    hints = [hint for hint in hints if hint is not None and hint > 0]
     if hints:
         out["interval_hint"] = hints[-1]
     out["dates"] = sorted(dates)
+    if stitch_flow:
+        _stitch_flow_boundaries(out, usable_rollups)
+    else:
+        # Per-node Flow windows cannot be unioned into one global time series,
+        # but their count sum and longest per-node run are exact.  Expose that
+        # explicit scope only if every source has the boundary metadata needed
+        # to make its own flow summary trustworthy.
+        out["cluster"]["flow_complete"] = (
+            all(_rollup_has_flow_metadata(roll)
+                for roll in usable_rollups))
+        out["cluster"]["flow_scope"] = (
+            "node" if len(usable_rollups) > 1 else "device")
     return out
 
 
@@ -612,15 +1220,76 @@ def _current_idle(data_dir, today_str, owner_filter, now_fn):
 # --- query ------------------------------------------------------------------
 
 def _filter_owner(roll, owner):
-    """Return a copy of roll restricted to a single owner (and its pods)."""
+    """Return a copy of roll restricted to one owner (and its pods).
+
+    Device telemetry is intrinsically cluster-wide, so it is deliberately
+    removed from an owner-filtered result rather than being misread as that
+    owner's utilization pulse.  Owner efficiency remains available from the
+    per-owner accumulators.
+    """
     if owner is None:
         return roll
     out = dict(roll)
     owners = roll.get("owners") or {}
+    if not isinstance(owners, dict):
+        owners = {}
     out["owners"] = {owner: owners[owner]} if owner in owners else {}
     pods = roll.get("pods") or {}
-    out["pods"] = {k: v for k, v in pods.items() if v.get("owner") == owner}
+    if not isinstance(pods, dict):
+        pods = {}
+    out["pods"] = {k: v for k, v in pods.items()
+                   if isinstance(v, dict) and v.get("owner") == owner}
+    out["cluster"] = _empty_cluster()
     return out
+
+
+_CLUSTER_REQUIRED_KEYS = (
+    "util_weight", "hour_util_wsum", "hour_util_weight", "util_hist",
+    "flow_first_state", "flow_last_state", "flow_leading_seconds",
+    "flow_trailing_seconds", "flow_first_ts", "flow_last_ts",
+    "flow_all_one_run", "flow_complete",
+)
+
+
+def _rollup_has_cluster_schema(roll):
+    """True only for a complete v2 telemetry shape, never for a v1 default."""
+    if not isinstance(roll, dict):
+        return False
+    version = _number(roll.get("v"))
+    cluster = roll.get("cluster")
+    return (version is not None and version >= ROLLUP_VERSION
+            and isinstance(cluster, dict)
+            and all(key in cluster for key in _CLUSTER_REQUIRED_KEYS))
+
+
+def _rollup_has_device_telemetry(roll):
+    if not _rollup_has_cluster_schema(roll):
+        return False
+    return (_number((roll.get("cluster") or {}).get("util_weight")) or 0.0) > 0
+
+
+def _legacy_rebuild(raw_path):
+    """Build one raw day once per unchanged source file in this process.
+
+    The lock intentionally covers the cold build.  This path is only for a
+    first v1 -> v2 upgrade; serializing it prevents a burst of /stats requests
+    from duplicating decompression/accounting and guarantees every caller gets
+    an equivalent complete rollup.
+    """
+    try:
+        stat = os.stat(raw_path)
+        key = (os.path.abspath(raw_path), stat.st_size, stat.st_mtime)
+    except OSError:
+        return build_rollup(raw_path)
+    with _LEGACY_REBUILD_CACHE_LOCK:
+        cached = _LEGACY_REBUILD_CACHE.get(key)
+        if cached is not None:
+            return cached
+        rebuilt = build_rollup(raw_path)
+        if len(_LEGACY_REBUILD_CACHE) >= _LEGACY_REBUILD_CACHE_MAX:
+            _LEGACY_REBUILD_CACHE.clear()
+        _LEGACY_REBUILD_CACHE[key] = rebuilt
+        return rebuilt
 
 
 def query(data_dir, days=7, owner=None, now_fn=None):
@@ -639,6 +1308,7 @@ def query(data_dir, days=7, owner=None, now_fn=None):
 
     rollups = []
     dates_covered = []
+    telemetry_dates_covered = []
     daily = []
     current_idle = []
     current_idle_done = False
@@ -655,8 +1325,39 @@ def query(data_dir, days=7, owner=None, now_fn=None):
             except Exception:
                 roll = None
 
-        if roll is None:
+        # v1 rollups cannot produce a truthful cluster pulse.  Rebuild them
+        # lazily from the raw/gz history when it still exists, then atomically
+        # persist v2 once.  If persistence is forbidden, the in-process cache
+        # above avoids repeated decompression while retaining the old file.
+        raw = None
+        if roll is not None and not _rollup_has_cluster_schema(roll):
             raw = _raw_path_for(data_dir, date_str)
+            if raw is not None:
+                legacy_roll = roll
+                try:
+                    rebuilt = _legacy_rebuild(raw)
+                    # A syntactically readable but fully corrupt/empty raw
+                    # file must never erase a non-empty historical rollup.
+                    # In that case retain the trusted v1 owner totals and
+                    # omit pulse telemetry for this day.
+                    rebuilt_samples = _number(rebuilt.get("samples")) or 0.0
+                    legacy_samples = _number(legacy_roll.get("samples")) or 0.0
+                    if rebuilt_samples > 0 or legacy_samples <= 0:
+                        roll = rebuilt
+                        _try_write_rollup(raw, roll)
+                    else:
+                        roll = legacy_roll
+                except Exception:
+                    # The old owner-only rollup remains useful even if a raw
+                    # file has been corrupted since it was originally rolled.
+                    try:
+                        with open(rollup_path, "r", encoding="utf-8") as fh:
+                            roll = json.load(fh)
+                    except Exception:
+                        roll = None
+
+        if roll is None:
+            raw = raw or _raw_path_for(data_dir, date_str)
             if raw is not None:
                 try:
                     if date_str == today_str:
@@ -668,24 +1369,32 @@ def query(data_dir, days=7, owner=None, now_fn=None):
                 except Exception:
                     roll = None
 
-        if roll is not None and roll.get("samples", 0) >= 0:
-            has_data = roll.get("samples", 0) > 0 or roll.get("owners")
+        samples = _number((roll or {}).get("samples"))
+        if roll is not None and (samples is None or samples >= 0):
+            has_data = (samples or 0.0) > 0 or bool(roll.get("owners"))
             if has_data:
                 filtered = _filter_owner(roll, owner)
                 rollups.append(filtered)
                 dates_covered.append(date_str)
+                if owner is None and _rollup_has_device_telemetry(roll):
+                    telemetry_dates_covered.append(date_str)
                 # Reuse the per-day (owner-filtered) rollup we just loaded;
                 # no second file read.
                 day_owners = {}
-                for own, acc in (filtered.get("owners") or {}).items():
-                    day_owners[own] = acc.get("gpu_seconds", 0.0)
+                filtered_owners = filtered.get("owners") or {}
+                if not isinstance(filtered_owners, dict):
+                    filtered_owners = {}
+                for own, acc in filtered_owners.items():
+                    day_owners[own] = (_number(
+                        acc.get("gpu_seconds") if isinstance(acc, dict)
+                        else None) or 0.0)
                 daily.append({
                     "date": date_str,
                     "owners": day_owners,
                     "coverage_seconds": filtered.get("coverage_seconds", 0.0),
                 })
 
-    merged = merge_rollups(rollups)
+    merged = merge_rollups(rollups, stitch_flow=True)
 
     if not current_idle_done:
         current_idle = _current_idle(data_dir, today_str, owner, now_fn)
@@ -695,6 +1404,15 @@ def query(data_dir, days=7, owner=None, now_fn=None):
         merged.get("pods_coverage_seconds", 0.0),
         merged.get("coverage_seconds", 0.0))
 
+    insights = cluster_insights(merged)
+    insights["telemetry_dates_covered"] = telemetry_dates_covered
+    insights["available_dates_covered"] = list(dates_covered)
+    insights["telemetry_coverage"] = {
+        "covered": len(telemetry_dates_covered),
+        "available": len(dates_covered),
+        "unit": "days",
+    }
+
     return {
         "window_days": days,
         "dates_covered": dates_covered,
@@ -702,6 +1420,9 @@ def query(data_dir, days=7, owner=None, now_fn=None):
         "current_idle": current_idle,
         "daily": daily,
         "awards": awards,
+        "insights": insights,
+        "momentum": owner_momentum(daily, merged.get("owners") or {}),
+        "telemetry_dates_covered": telemetry_dates_covered,
         "generated_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
@@ -730,7 +1451,8 @@ def merge_query_results(labeled_results):
         valid.append((label, res))
 
     # merged: element-wise merge of each result's (rollup-shaped) "merged".
-    merged = merge_rollups([res.get("merged") for _lbl, res in valid])
+    merged = merge_rollups([res.get("merged") for _lbl, res in valid],
+                           stitch_flow=False)
 
     # owner_nodes: {owner: {label: gpu_seconds}} from each merged.owners.
     owner_nodes = {}
@@ -787,15 +1509,45 @@ def merge_query_results(labeled_results):
     window_days = 0
     dates_covered = set()
     generated_utc = ""
+    telemetry_dates_covered = set()
+    telemetry_covered_partitions = 0
+    telemetry_available_partitions = 0
     for _label, res in valid:
         wd = res.get("window_days", 0) or 0
         if wd > window_days:
             window_days = wd
         for ds in res.get("dates_covered") or []:
             dates_covered.add(ds)
+        for ds in res.get("telemetry_dates_covered") or []:
+            telemetry_dates_covered.add(ds)
+        coverage = (res.get("insights") or {}).get("telemetry_coverage")
+        if isinstance(coverage, dict):
+            covered = _number(coverage.get("covered"))
+            available = _number(coverage.get("available"))
+        else:
+            covered = available = None
+        # Peers running an older server do not carry the scalar coverage
+        # shape. Their date arrays still describe one node's day coverage.
+        telemetry_covered_partitions += int(
+            covered if covered is not None and covered >= 0
+            else len(res.get("telemetry_dates_covered") or []))
+        telemetry_available_partitions += int(
+            available if available is not None and available >= 0
+            else len(res.get("dates_covered") or []))
         gu = res.get("generated_utc") or ""
         if gu > generated_utc:
             generated_utc = gu
+
+    insights = cluster_insights(merged)
+    insights["telemetry_dates_covered"] = sorted(telemetry_dates_covered)
+    insights["available_dates_covered"] = sorted(dates_covered)
+    insights["telemetry_coverage"] = {
+        # A date union is insufficient here: node-01 and node-02 can have
+        # different telemetry availability on the same UTC date.
+        "covered": telemetry_covered_partitions,
+        "available": telemetry_available_partitions,
+        "unit": "node-days",
+    }
 
     return {
         "window_days": window_days,
@@ -804,6 +1556,9 @@ def merge_query_results(labeled_results):
         "current_idle": current_idle,
         "daily": daily,
         "awards": awards,
+        "insights": insights,
+        "momentum": owner_momentum(daily, merged.get("owners") or {}),
+        "telemetry_dates_covered": sorted(telemetry_dates_covered),
         "generated_utc": generated_utc,
         "scope": "lab",
         "node_labels": node_labels,
@@ -825,6 +1580,123 @@ def _eff_util(acc):
     if sm is not None:
         return sm
     return _avg(acc.get("util_wsum", 0.0), acc.get("util_weight", 0.0))
+
+
+def _safe_avg(wsum, weight):
+    """Numeric-only weighted average for optional/older rollup fields."""
+    wsum = _number(wsum)
+    weight = _number(weight)
+    if wsum is None or weight is None or weight <= 0:
+        return None
+    return wsum / weight
+
+
+def cluster_insights(merged):
+    """Return presentation-ready cluster telemetry from a merged rollup.
+
+    This is intentionally a pure derived view: it costs no raw-file reads and
+    safely returns ``has_device_telemetry=False`` for rollup v1 files.  Values
+    are percentages except for the explicitly named seconds/hours fields.
+    """
+    cluster = (merged or {}).get("cluster") or {}
+    util_avg = _safe_avg(cluster.get("util_wsum"), cluster.get("util_weight"))
+    vram_avg = _safe_avg(cluster.get("mem_wsum"), cluster.get("mem_weight"))
+
+    def hourly(sum_key, weight_key):
+        sums = cluster.get(sum_key) or []
+        weights = cluster.get(weight_key) or []
+        return [_safe_avg(sums[i] if i < len(sums) else None,
+                          weights[i] if i < len(weights) else None)
+                for i in range(24)]
+
+    raw_hist = cluster.get("util_hist") or []
+    hist = []
+    for i in range(UTIL_BUCKETS):
+        value = _number(raw_hist[i] if i < len(raw_hist) else 0.0)
+        hist.append(value if value is not None and value > 0 else 0.0)
+    hist_total = sum(hist)
+
+    def share(start, end):
+        if hist_total <= 0:
+            return None
+        return 100.0 * sum(hist[start:end]) / hist_total
+
+    return {
+        "has_device_telemetry": util_avg is not None,
+        "has_flow": bool(cluster.get("flow_complete"))
+        and util_avg is not None,
+        "flow_scope": cluster.get("flow_scope") or "device",
+        "observed_gpu_hours": (_number(cluster.get("device_seconds")) or 0.0)
+        / 3600.0,
+        "util_avg": util_avg,
+        "vram_avg": vram_avg,
+        "util_by_hour_kst": hourly("hour_util_wsum", "hour_util_weight"),
+        "vram_by_hour_kst": hourly("hour_mem_wsum", "hour_mem_weight"),
+        # Four readable bands, while the underlying rollup retains 10 buckets.
+        "util_bands": {
+            "quiet": share(0, 1),       # 0-9%
+            "light": share(1, 4),       # 10-39%
+            "work": share(4, 7),        # 40-69%
+            "hot": share(7, 10),        # 70-100%
+        },
+        "busy_windows": int(_number(cluster.get("busy_windows")) or 0),
+        "busy_seconds": _number(cluster.get("busy_seconds")) or 0.0,
+        "idle_windows": int(_number(cluster.get("idle_windows")) or 0),
+        "idle_seconds": _number(cluster.get("idle_seconds")) or 0.0,
+        "longest_busy_seconds": _number(
+            cluster.get("longest_busy_seconds")) or 0.0,
+        "longest_idle_seconds": _number(
+            cluster.get("longest_idle_seconds")) or 0.0,
+    }
+
+
+def owner_momentum(daily, owners=None):
+    """Streak and consistency per owner over days with actual observations.
+
+    ``daily`` intentionally omits days with no samples.  Calling this
+    consistency *observed-day consistency* avoids treating monitor downtime as
+    a person's inactive day.  A current streak ends at the newest observed
+    date, not necessarily the wall-clock date.
+    """
+    days = [entry for entry in (daily or []) if isinstance(entry, dict)
+            and entry.get("date")]
+    names = set((owners or {}).keys())
+    for entry in days:
+        names.update((entry.get("owners") or {}).keys())
+    observed = len(days)
+    out = []
+    for owner in names:
+        activity = []
+        for entry in days:
+            value = _number((entry.get("owners") or {}).get(owner)) or 0.0
+            activity.append(value > 0)
+        active_days = sum(1 for active in activity if active)
+        longest = run = 0
+        for active in activity:
+            run = run + 1 if active else 0
+            if run > longest:
+                longest = run
+        current = 0
+        for active in reversed(activity):
+            if not active:
+                break
+            current += 1
+        acc = (owners or {}).get(owner) or {}
+        out.append({
+            "owner": owner,
+            "active_days": active_days,
+            "observed_days": observed,
+            "consistency_pct": (100.0 * active_days / observed
+                                if observed else 0.0),
+            "current_streak_days": current,
+            "longest_streak_days": longest,
+            "gpu_seconds": _number(acc.get("gpu_seconds")) or 0.0,
+            "efficiency_pct": _eff_util(acc),
+        })
+    out.sort(key=lambda item: (-item["current_streak_days"],
+                               -item["consistency_pct"],
+                               -item["gpu_seconds"], str(item["owner"])))
+    return out
 
 
 def _owner_width(owners):
@@ -1042,6 +1914,165 @@ def _award_prefix(key, unicode_ok):
     return ""
 
 
+def _format_duration(seconds):
+    """Compact, deterministic duration for terminal insight lines."""
+    seconds = max(0, int(round(_number(seconds) or 0.0)))
+    hours, seconds = divmod(seconds, 3600)
+    minutes = seconds // 60
+    if hours:
+        return "%dh%02dm" % (hours, minutes)
+    if minutes:
+        return "%dm" % minutes
+    return "%ds" % seconds
+
+
+def _percentage_spark(values, max_cells, unicode_ok):
+    """Fixed-range 0..100% sparkline, downsampled without dependencies."""
+    values = list(values or [])
+    if max_cells < 1:
+        return ""
+    if len(values) > max_cells:
+        reduced = []
+        for cell in range(max_cells):
+            start = int(cell * len(values) / float(max_cells))
+            end = max(start + 1, int((cell + 1) * len(values) / float(max_cells)))
+            nums = [_percent(v) for v in values[start:end]]
+            nums = [v for v in nums if v is not None]
+            reduced.append(sum(nums) / len(nums) if nums else None)
+        values = reduced
+    glyphs = " ▁▂▃▄▅▆▇█" if unicode_ok else " .:-=+*#"
+    top = len(glyphs) - 1
+    out = []
+    for value in values:
+        value = _percent(value)
+        if value is None:
+            out.append(" ")
+        else:
+            out.append(glyphs[int(round(value * top / 100.0))])
+    return "".join(out)
+
+
+def _pct_text(value):
+    return "--" if value is None else "%d%%" % int(round(value))
+
+
+def _telemetry_coverage(insights):
+    """Return ``(partial, label)`` without losing LAB node-day coverage."""
+    coverage = (insights or {}).get("telemetry_coverage")
+    if isinstance(coverage, dict):
+        covered = _number(coverage.get("covered"))
+        available = _number(coverage.get("available"))
+        if (covered is not None and available is not None
+                and covered >= 0 and available >= 0):
+            unit = str(coverage.get("unit") or "days")
+            return covered < available, "%d/%d %s" % (
+                int(covered), int(available), unit)
+    telemetry_dates = (insights or {}).get("telemetry_dates_covered") or []
+    available_dates = (insights or {}).get("available_dates_covered") or []
+    return (bool(available_dates) and len(telemetry_dates) < len(available_dates),
+            "%d/%d days" % (len(telemetry_dates), len(available_dates)))
+
+
+def _render_cluster_pulse(lines, result, width, color, unicode_ok):
+    """Append the compact cluster telemetry hierarchy when v2 data exists."""
+    insights = result.get("insights")
+    if not isinstance(insights, dict):
+        insights = cluster_insights(result.get("merged") or {})
+    if not insights.get("has_device_telemetry"):
+        return False
+
+    util = insights.get("util_avg")
+    vram = insights.get("vram_avg")
+    bands = insights.get("util_bands") or {}
+    hot = bands.get("hot")
+    partial, coverage_label = _telemetry_coverage(insights)
+    pulse_title = "Cluster pulse"
+    if partial:
+        pulse_title += " (partial telemetry: %s)" % coverage_label
+    lines.append(_c("bold", pulse_title, color))
+
+    # Wide terminals get two 24-hour KST sparklines.  Keep the labels and
+    # headline figures intact on smaller terminals rather than wrapping a
+    # graph into an unreadable shape.
+    if width >= 76:
+        spark_cells = min(24, max(12, width - 50))
+        util_spark = _percentage_spark(insights.get("util_by_hour_kst"),
+                                       spark_cells, unicode_ok)
+        vram_spark = _percentage_spark(insights.get("vram_by_hour_kst"),
+                                       spark_cells, unicode_ok)
+        lines.append("KST  UTIL %-*s  avg %s  hot %s" % (
+            spark_cells, util_spark, _pct_text(util), _pct_text(hot)))
+        lines.append("     VRAM %-*s  avg %s" % (
+            spark_cells, vram_spark, _pct_text(vram)))
+        lines.append("UTIL mix  quiet %s  light %s  work %s  hot %s" % (
+            _pct_text(bands.get("quiet")), _pct_text(bands.get("light")),
+            _pct_text(bands.get("work")), _pct_text(hot)))
+        busy_windows = insights.get("busy_windows", 0)
+        longest = insights.get("longest_busy_seconds", 0.0)
+        if insights.get("has_flow") and busy_windows:
+            if insights.get("flow_scope") == "node":
+                flow_line = ("Flow      %d node compute windows  ·  longest %s "
+                             "per-node (any GPU >= %d%%)" % (
+                                 busy_windows, _format_duration(longest),
+                                 BUSY_UTIL_THRESHOLD))
+            else:
+                flow_line = ("Flow      %d compute windows  ·  longest %s "
+                             "(any GPU >= %d%%)" % (
+                                 busy_windows, _format_duration(longest),
+                                 BUSY_UTIL_THRESHOLD))
+            lines.append(_c("dim", flow_line, color))
+    elif width >= 54:
+        spark_cells = min(18, max(8, width - 34))
+        spark = _percentage_spark(insights.get("util_by_hour_kst"),
+                                  spark_cells, unicode_ok)
+        lines.append("KST UTIL %-*s  avg %s" %
+                     (spark_cells, spark, _pct_text(util)))
+        lines.append("VRAM %s  hot %s  %d windows" % (
+            _pct_text(vram), _pct_text(hot),
+            insights.get("busy_windows", 0)))
+    else:
+        lines.append("util %s  vram %s  hot %s" %
+                     (_pct_text(util), _pct_text(vram), _pct_text(hot)))
+    return True
+
+
+def _render_momentum(lines, result, width, color):
+    """Append one focused owner-streak line below the leaderboard."""
+    momentum = result.get("momentum")
+    if not isinstance(momentum, list):
+        merged = result.get("merged") or {}
+        momentum = owner_momentum(result.get("daily") or [],
+                                   merged.get("owners") or {})
+    eligible = [row for row in momentum if isinstance(row, dict)
+                and row.get("observed_days", 0) >= 2
+                and row.get("active_days", 0) > 0]
+    if not eligible:
+        return False
+
+    lines.append(_c("bold", "Momentum", color))
+    if width < 58:
+        row = eligible[0]
+        lines.append("%s  %dd streak  ·  %d/%d active observed days" % (
+            _clip(row.get("owner"), 14), row.get("current_streak_days", 0),
+            row.get("active_days", 0), row.get("observed_days", 0)))
+        return True
+
+    parts = []
+    for row in eligible[:3]:
+        eff = row.get("efficiency_pct")
+        eff_text = "" if eff is None else " · %d%% eff" % int(round(eff))
+        part = "%s %dd streak · %d/%dd%s" % (
+            _clip(row.get("owner"), 14), row.get("current_streak_days", 0),
+            row.get("active_days", 0), row.get("observed_days", 0), eff_text)
+        candidate = "  |  ".join(parts + [part])
+        if parts and len(candidate) > width:
+            break
+        parts.append(part)
+    lines.append("  |  ".join(parts))
+    lines.append(_c("dim", "streaks and consistency use observed days only", color))
+    return True
+
+
 def _awards_struct(owners, pods_cov, coverage_seconds):
     """Build the structured awards list (dicts) from owner accumulators.
 
@@ -1098,6 +2129,9 @@ def render_stats_text(result, color=False, width=100, unicode_ok=True):
     if not owners and merged.get("samples", 0) == 0:
         lines.append("no samples recorded yet")
         return "\n".join(lines) + "\n"
+
+    if _render_cluster_pulse(lines, result, width, color, unicode_ok):
+        rule()
 
     ranked = sorted(owners.items(),
                     key=lambda kv: kv[1].get("gpu_seconds", 0.0),
@@ -1173,6 +2207,8 @@ def render_stats_text(result, color=False, width=100, unicode_ok=True):
         lines.append(_c("dim",
                         "(allocation stats unavailable: no pod API coverage)",
                         color))
+
+    _render_momentum(lines, result, width, color)
     rule()
 
     # --- d. daily activity calendar (the "grass") ---

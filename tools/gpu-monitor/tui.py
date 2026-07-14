@@ -44,6 +44,11 @@ STATS_URL = os.environ.get(
 DEFAULT_INTERVAL = float(os.environ.get("SGPU_TUI_INTERVAL", "2"))
 POD_NAMESPACE = os.environ.get("POD_NAMESPACE", "")
 SGPU_PEERS = os.environ.get("SGPU_PEERS", "")
+try:
+    OUTPUT_STALL_SECONDS = max(
+        5.0, float(os.environ.get("SGPU_TUI_OUTPUT_STALL_SECONDS", "45")))
+except ValueError:
+    OUTPUT_STALL_SECONDS = 45.0
 
 SORT_MODES = ("gpu", "mem", "owner")
 
@@ -326,6 +331,10 @@ def poll_key(stdscr, input_fd=0, select_fn=select.select):
     return stdscr.getch()
 
 
+class OutputDisconnected(RuntimeError):
+    """The remote kubectl-exec consumer stopped draining terminal output."""
+
+
 class CursesOutputBuffer:
     """Capture each curses frame before forwarding it to the real PTY.
 
@@ -336,13 +345,16 @@ class CursesOutputBuffer:
     is retained so escape sequences are never truncated.
     """
 
-    def __init__(self, stream=None):
+    def __init__(self, stream=None, clock=time.monotonic):
         stream = sys.stdout if stream is None else stream
+        self.clock = clock
         self.output_fd = stream.fileno()
         self.real_fd = os.dup(self.output_fd)
         self.was_blocking = os.get_blocking(self.real_fd)
         self.read_fd, write_fd = os.pipe()
         self.pending = b""
+        self.pending_since = None
+        self.last_progress_at = None
         self.broken = False
         self.closed = False
         try:
@@ -386,13 +398,26 @@ class CursesOutputBuffer:
             if written <= 0:
                 return False
             self.pending = self.pending[written:]
+            self.last_progress_at = self.clock()
+            if not self.pending:
+                self.pending_since = None
         return True
 
     def send_frame(self, frame):
         if self.pending or self.broken:
             return False
         self.pending = frame
+        if frame:
+            now = self.clock()
+            self.pending_since = now
+            self.last_progress_at = now
         return self.flush_pending()
+
+    def stalled(self, now, timeout):
+        """Whether terminal output has made no byte-level progress too long."""
+        if not self.pending or self.last_progress_at is None:
+            return False
+        return now - self.last_progress_at >= timeout
 
     def close(self):
         if self.closed:
@@ -400,6 +425,10 @@ class CursesOutputBuffer:
         self.closed = True
         tail = self.take_frame()
         if tail:
+            if not self.pending:
+                now = self.clock()
+                self.pending_since = now
+                self.last_progress_at = now
             self.pending += tail
         self.flush_pending()  # best effort; never wait for a wedged consumer
         try:
@@ -420,13 +449,25 @@ class RefreshController:
     """
 
     def __init__(self, clock=time.monotonic, min_backoff=0.05,
-                 max_backoff=1.0, output=None):
+                 max_backoff=1.0, output=None,
+                 output_stall_seconds=OUTPUT_STALL_SECONDS):
         self.clock = clock
         self.min_backoff = min_backoff
         self.max_backoff = max_backoff
         self.output = output
+        self.output_stall_seconds = output_stall_seconds
         self.failures = 0
         self.retry_at = 0.0
+
+    def _check_output_liveness(self, now):
+        if self.output is None:
+            return
+        if self.output.broken:
+            raise OutputDisconnected("terminal output closed")
+        if self.output.stalled(now, self.output_stall_seconds):
+            raise OutputDisconnected(
+                "terminal output made no progress for %.1fs"
+                % self.output_stall_seconds)
 
     def _failed(self, stdscr, curses, now):
         self.failures += 1
@@ -445,6 +486,7 @@ class RefreshController:
         if now < self.retry_at:
             return False
         if self.output is not None and not self.output.flush_pending():
+            self._check_output_liveness(now)
             return self._failed(stdscr, curses, now)
         try:
             stdscr.refresh()
@@ -455,6 +497,7 @@ class RefreshController:
         if self.output is not None:
             frame = self.output.take_frame()
             if not self.output.send_frame(frame):
+                self._check_output_liveness(now)
                 return self._failed(stdscr, curses, now)
         self.failures = 0
         self.retry_at = 0.0
@@ -1076,6 +1119,125 @@ def _fmt_num(value, spec="%.1f"):
     return spec % value
 
 
+def _pulse_percent(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if value != value:
+        return None
+    return max(0.0, min(100.0, value))
+
+
+def _pulse_spark(values, cells, unicode_ok=True):
+    """A no-dependency, fixed 0..100% sparkline for the stats pulse."""
+    values = list(values or [])
+    if cells < 1:
+        return ""
+    if len(values) > cells:
+        compact = []
+        for cell in range(cells):
+            start = int(cell * len(values) / float(cells))
+            end = max(start + 1,
+                      int((cell + 1) * len(values) / float(cells)))
+            numbers = [_pulse_percent(v) for v in values[start:end]]
+            numbers = [v for v in numbers if v is not None]
+            compact.append(sum(numbers) / len(numbers) if numbers else None)
+        values = compact
+    glyphs = " ▁▂▃▄▅▆▇█" if unicode_ok else " .:-=+*#"
+    top = len(glyphs) - 1
+    return "".join(
+        " " if _pulse_percent(value) is None
+        else glyphs[int(round(_pulse_percent(value) * top / 100.0))]
+        for value in values)
+
+
+def format_pulse_summary(insights, width=120, unicode_ok=True):
+    """One compact hierarchy line for the curses stats view, or ``None``.
+
+    Server-side aggregation provides the values; this function only chooses a
+    terminal-safe representation.  That keeps the TUI responsive and makes
+    old rollups (which have no v2 telemetry) disappear gracefully.
+    """
+    if not isinstance(insights, dict) or not insights.get("has_device_telemetry"):
+        return None
+    util = _pulse_percent(insights.get("util_avg"))
+    if util is None:
+        return None
+    vram = _pulse_percent(insights.get("vram_avg"))
+    hot = _pulse_percent((insights.get("util_bands") or {}).get("hot"))
+    windows = int(insights.get("busy_windows") or 0)
+    if insights.get("has_flow"):
+        flow_text = ("  %d node windows" % windows
+                     if insights.get("flow_scope") == "node"
+                     else "  %d windows" % windows)
+    else:
+        flow_text = ""
+    vram_text = "--" if vram is None else "%d%%" % int(round(vram))
+    hot_text = "--" if hot is None else "%d%%" % int(round(hot))
+    telemetry_dates = insights.get("telemetry_dates_covered") or []
+    available_dates = insights.get("available_dates_covered") or []
+    coverage = ""
+    parsed_coverage = False
+    coverage_data = insights.get("telemetry_coverage")
+    if isinstance(coverage_data, dict):
+        try:
+            covered = int(coverage_data.get("covered"))
+            available = int(coverage_data.get("available"))
+        except (TypeError, ValueError):
+            covered = available = None
+        if (covered is not None and available is not None
+                and covered >= 0 and available >= 0):
+            parsed_coverage = True
+            if covered < available:
+                unit = str(coverage_data.get("unit") or "days")
+                coverage = "  partial %d/%d %s" % (covered, available, unit)
+    if (not parsed_coverage and available_dates
+            and len(telemetry_dates) < len(available_dates)):
+        coverage = "  partial %d/%dd" % (len(telemetry_dates),
+                                           len(available_dates))
+    if width >= 84:
+        # Leave room for headline numbers and the optional partial-history
+        # marker; a clipped pulse is less useful than a shorter sparkline.
+        cells = min(24, max(12, width - 70))
+        spark = _pulse_spark(insights.get("util_by_hour_kst"), cells,
+                             unicode_ok=unicode_ok)
+        return "PULSE KST %-*s util %d%%  VRAM %s  hot %s%s%s" % (
+            cells, spark, int(round(util)), vram_text, hot_text, flow_text,
+            coverage)
+    if width >= 58:
+        cells = min(16, max(8, width - 40))
+        spark = _pulse_spark(insights.get("util_by_hour_kst"), cells,
+                             unicode_ok=unicode_ok)
+        return "PULSE %-*s util %d%%  VRAM %s  hot %s%s" % (
+            cells, spark, int(round(util)), vram_text, hot_text, coverage)
+    return "PULSE util %d%%  VRAM %s  hot %s%s" % (
+        int(round(util)), vram_text, hot_text, coverage)
+
+
+def format_momentum_summary(momentum, width=120):
+    """Return the most current owner streak in one narrow-safe line."""
+    if not isinstance(momentum, list):
+        return None
+    rows = [row for row in momentum if isinstance(row, dict)
+            and row.get("observed_days", 0) >= 2
+            and row.get("active_days", 0) > 0]
+    if not rows:
+        return None
+    row = rows[0]
+    name = render.clip(str(row.get("owner") or "?"), 16)
+    text = "MOMENTUM %s  %dd streak  %d/%dd active" % (
+        name, int(row.get("current_streak_days") or 0),
+        int(row.get("active_days") or 0),
+        int(row.get("observed_days") or 0))
+    efficiency = _pulse_percent(row.get("efficiency_pct"))
+    if efficiency is not None and width >= 70:
+        text += "  %d%% eff" % int(round(efficiency))
+    if width >= 86:
+        text += " observed days"
+    return text
+
+
 def _owner_node_label(owner, owner_nodes):
     """One node label if >=95% of the owner's time is there, else 'both'."""
     per_node = (owner_nodes or {}).get(owner) or {}
@@ -1188,6 +1350,9 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
     window_days = data.get("window_days", days)
     daily = data.get("daily") or []
     awards = data.get("awards") or []
+    pulse = format_pulse_summary(data.get("insights"), width=width,
+                                 unicode_ok=uok)
+    momentum = format_momentum_summary(data.get("momentum"), width=width)
     owner_nodes = data.get("owner_nodes") if data.get("scope") == "lab" \
         else None
     owner_tags = render.owner_tag_map(
@@ -1202,11 +1367,16 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
     if loading:
         title.append(("  %s loading…" % spin, "warn"))
     put(title)
+    # The pulse is the first substantive line: it gives the cluster's shape
+    # before playful awards or the per-owner grid.  On a short terminal it
+    # takes priority over awards, while the grid still always remains visible.
+    if pulse and height >= 12:
+        put([("PULSE ", "section"), (pulse[len("PULSE "):], "dim")])
     rule()
 
     # --- awards (dropped first when the terminal is short) ---
     # Reserve rows for footer(1) + grid essentials so we know our budget.
-    show_awards = awards and height >= 16
+    show_awards = awards and height >= 19
     if show_awards:
         for aw in awards[:5]:
             icon = aw.get("icon") or aw.get("ascii") or "*"
@@ -1231,6 +1401,12 @@ def draw_stats(stdscr, curses, stats_fetcher, statsview, painter, attrs,
         lb_budget = max(0, remaining - grid_reserve)
         for row in lb_rows[:lb_budget]:
             put(row)
+        rule()
+
+    # Keep momentum to one line and reserve it for roomy views; the following
+    # grid remains the detailed visual answer on compact terminals.
+    if momentum and width >= 58 and height >= 25:
+        put([(momentum, "dim")])
         rule()
 
     # --- the GRID ---
@@ -1401,6 +1577,12 @@ def help_lines(width=120):
         ("ALLOC-H", "allocated GPU-hours from pods' GPU requests."),
         ("IDLE-H / IDLE%", "allocated but no process running "
          "(a wasted reservation)."),
+        ("Cluster pulse", "KST device utilization/VRAM rhythm plus weighted "
+         "quiet/light/work/hot utilization zones."),
+        ("Flow", "observed windows where any GPU was at least 50% utilized; "
+         "missing telemetry breaks a window; it describes cadence, not job starts."),
+        ("Momentum", "owner streak and active-day count over observed days "
+         "only; monitor downtime is excluded."),
         ("REQ / ACT (pods table)", "GPUs a pod requested vs. actively "
          "using now."),
         ("POWER / TEMP", "power draw / cap, and temperature."),
@@ -2274,6 +2456,13 @@ def main():
                     stdscr, curses, fetcher, view, output=output))
         finally:
             output.close()
+    except OutputDisconnected:
+        # Do not fall back to rendering a one-shot screen here: that would
+        # write to the same stalled kubectl-exec PTY and recreate the orphan.
+        # Returning 75 is deliberate: kubectl reports it to the local client
+        # on its own stderr stream, while printing here could block forever on
+        # the already-full PTY.
+        return 75
     except KeyboardInterrupt:
         pass
     except Exception as exc:
