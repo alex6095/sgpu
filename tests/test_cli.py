@@ -120,6 +120,8 @@ class TestInteractiveReconnect(unittest.TestCase):
         self._random = cli.random.random
         self._recovery_window = cli._RECONNECT_RECOVERY_WINDOW_SECONDS
         self._watchdog_stable = cli._WATCHDOG_STABLE_SESSION_SECONDS
+        self._signal_settle = cli._SIGNAL_SETTLE_SECONDS
+        self._signal_settle_delay = cli._SIGNAL_SETTLE_INITIAL_DELAY_SECONDS
         self.sleeps = []
         cli.time.sleep = lambda seconds: self.sleeps.append(seconds)
         cli.time.monotonic = lambda: 0
@@ -137,14 +139,21 @@ class TestInteractiveReconnect(unittest.TestCase):
         cli.random.random = self._random
         cli._RECONNECT_RECOVERY_WINDOW_SECONDS = self._recovery_window
         cli._WATCHDOG_STABLE_SESSION_SECONDS = self._watchdog_stable
+        cli._SIGNAL_SETTLE_SECONDS = self._signal_settle
+        cli._SIGNAL_SETTLE_INITIAL_DELAY_SECONDS = self._signal_settle_delay
 
     @staticmethod
-    def _state(uid="pod-a", ready=True, restart_count=0):
+    def _state(uid="pod-a", ready=True, restart_count=0,
+               monitor_image="image:old", container_id="container:old",
+               started_at="2026-07-14T22:00:00Z"):
         return {
             "uid": uid,
             "phase": "Running" if ready else "Pending",
             "ready": ready,
             "restart_count": restart_count,
+            "monitor_image": monitor_image,
+            "container_id": container_id,
+            "started_at": started_at,
             "error": None,
         }
 
@@ -177,6 +186,77 @@ class TestInteractiveReconnect(unittest.TestCase):
         self.assertEqual(self.sleeps, [1])
         written = "".join(sys.stdout.buffer)
         self.assertIn(cli._TERM_RESTORE, written)
+
+    def test_fast_same_uid_restart_settles_until_new_container_state(self):
+        """The first post-exec get can still show the old Ready container."""
+        before = self._state(
+            uid="same", restart_count=12, monitor_image="monitor:0.8.18",
+            container_id="container:old", started_at="old-start")
+        first_post = dict(before)
+        settled = self._state(
+            uid="same", restart_count=13, monitor_image="monitor:0.8.19",
+            container_id="container:new", started_at="new-start")
+        states = iter([before, first_post, settled])
+        cli._pod_state = lambda ns, pod: next(states)
+        calls = self._exec_results([
+            (137, "command terminated with exit code 137\n"),
+            (0, ""),
+        ])
+        self.assertEqual(
+            cli._interactive("ns", "pod", ["python3", "tui.py"], False), 0)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.sleeps, [0.25, 1])
+        self.assertIn("monitor pod changed", "".join(sys.stderr.buffer))
+
+    def test_unchanged_ready_pod_after_signal_fails_fast_after_settling(self):
+        state = self._state(restart_count=12)
+        clock = [0.0]
+        cli._SIGNAL_SETTLE_SECONDS = 1
+        cli._SIGNAL_SETTLE_INITIAL_DELAY_SECONDS = 0.5
+        cli.time.monotonic = lambda: clock[0]
+
+        def sleep(seconds):
+            self.sleeps.append(seconds)
+            clock[0] += seconds
+
+        cli.time.sleep = sleep
+        cli._pod_state = lambda ns, pod: state
+        calls = self._exec_results([
+            (137, "command terminated with exit code 137\n"),
+        ])
+        self.assertEqual(
+            cli._interactive("ns", "pod", ["python3", "tui.py"], False), 137)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.sleeps, [0.5, 0.5])
+        self.assertIn("lifecycle stayed unchanged",
+                      "".join(sys.stderr.buffer))
+
+    def test_sigterm_with_same_uid_restart_reconnects(self):
+        before = self._state(
+            uid="same", restart_count=12, container_id="container:old",
+            started_at="old-start")
+        after = self._state(
+            uid="same", restart_count=13, container_id="container:new",
+            started_at="new-start")
+        states = iter([before, after])
+        cli._pod_state = lambda ns, pod: next(states)
+        calls = self._exec_results([
+            (143, "command terminated with exit code 143\n"),
+            (0, ""),
+        ])
+        self.assertEqual(
+            cli._interactive("ns", "pod", ["python3", "tui.py"], False), 0)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.sleeps, [1])
+
+    def test_signal_termination_recognizes_137_and_143_only(self):
+        for code in (137, 143):
+            with self.subTest(code=code):
+                self.assertTrue(cli._is_remote_signal_termination(code, ""))
+        self.assertTrue(cli._is_remote_signal_termination(
+            1, "command terminated with exit code 143"))
+        self.assertFalse(cli._is_remote_signal_termination(
+            1, "command terminated with exit code 1"))
 
     def test_not_ready_pod_waits_before_reconnect(self):
         states = iter([self._state("old"), self._state("old", ready=False)])
@@ -446,10 +526,21 @@ class TestReconnectReadiness(unittest.TestCase):
     def test_fake_kubectl_reports_uid_ready_restart_and_health(self):
         pod_json = json.dumps({
             "metadata": {"uid": "pod-uid"},
+            "spec": {"containers": [{
+                "name": "monitor",
+                "image": "docker.io/alex6095/sgpu-monitor:0.8.19",
+            }]},
             "status": {
                 "phase": "Running",
                 "conditions": [{"type": "Ready", "status": "True"}],
-                "containerStatuses": [{"restartCount": 12}],
+                "containerStatuses": [{
+                    "name": "monitor",
+                    "restartCount": 12,
+                    "containerID": "containerd://new",
+                    "state": {"running": {
+                        "startedAt": "2026-07-14T22:32:30Z",
+                    }},
+                }],
             },
         })
         calls = []
@@ -466,6 +557,10 @@ class TestReconnectReadiness(unittest.TestCase):
         state = cli._pod_state("ns", "pod")
         self.assertEqual((state["uid"], state["ready"], state["restart_count"]),
                          ("pod-uid", True, 12))
+        self.assertEqual(state["monitor_image"],
+                         "docker.io/alex6095/sgpu-monitor:0.8.19")
+        self.assertEqual(state["container_id"], "containerd://new")
+        self.assertEqual(state["started_at"], "2026-07-14T22:32:30Z")
         self.assertTrue(cli._monitor_healthy("ns", "pod"))
         self.assertIn("curl", calls[-1])
 

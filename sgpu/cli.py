@@ -395,6 +395,8 @@ _WATCHDOG_STABLE_SESSION_SECONDS = 90
 _RECONNECT_RECOVERY_WINDOW_SECONDS = 300
 _POD_STATUS_TIMEOUT_SECONDS = 5
 _HEALTH_TIMEOUT_SECONDS = 8
+_SIGNAL_SETTLE_SECONDS = 5
+_SIGNAL_SETTLE_INITIAL_DELAY_SECONDS = 0.25
 _RECONNECT_INITIAL_DELAY_SECONDS = 1
 _RECONNECT_MAX_DELAY_SECONDS = 16
 _RECONNECT_JITTER_FRACTION = 0.20
@@ -439,6 +441,9 @@ def _pod_state(namespace, pod):
         "phase": None,
         "ready": False,
         "restart_count": 0,
+        "monitor_image": None,
+        "container_id": None,
+        "started_at": None,
         "error": None,
     }
     try:
@@ -460,6 +465,7 @@ def _pod_state(namespace, pod):
         return state
 
     metadata = payload.get("metadata") or {}
+    spec = payload.get("spec") or {}
     status = payload.get("status") or {}
     state["uid"] = metadata.get("uid")
     state["phase"] = status.get("phase")
@@ -470,11 +476,24 @@ def _pod_state(namespace, pod):
                 and condition.get("status") == "True"
                 and not metadata.get("deletionTimestamp"))
             break
-    for container in status.get("containerStatuses") or []:
-        try:
-            state["restart_count"] += int(container.get("restartCount", 0))
-        except (TypeError, ValueError):
-            pass
+    spec_containers = spec.get("containers") or []
+    status_containers = status.get("containerStatuses") or []
+    monitor_spec = next(
+        (container for container in spec_containers
+         if container.get("name") == "monitor"),
+        spec_containers[0] if spec_containers else {})
+    monitor_status = next(
+        (container for container in status_containers
+         if container.get("name") == "monitor"),
+        status_containers[0] if status_containers else {})
+    state["monitor_image"] = monitor_spec.get("image")
+    state["container_id"] = monitor_status.get("containerID")
+    running = (monitor_status.get("state") or {}).get("running") or {}
+    state["started_at"] = running.get("startedAt")
+    try:
+        state["restart_count"] = int(monitor_status.get("restartCount", 0))
+    except (TypeError, ValueError):
+        pass
     return state
 
 
@@ -489,7 +508,13 @@ def _pod_restarted_or_recreated(before, after):
     if before.get("uid") and after.get("uid") \
             and before["uid"] != after["uid"]:
         return True
-    return after.get("restart_count", 0) > before.get("restart_count", 0)
+    if after.get("restart_count", 0) > before.get("restart_count", 0):
+        return True
+    for field in ("monitor_image", "container_id", "started_at"):
+        if (before.get(field) and after.get(field)
+                and before[field] != after[field]):
+            return True
+    return False
 
 
 def _pod_not_found(state):
@@ -521,8 +546,17 @@ def _is_transport_failure(stderr_text):
         or not lowered.strip()
 
 
+def _is_remote_signal_termination(code, stderr_text):
+    """Whether kubectl reports that the remote process received SIGKILL/TERM."""
+    lowered = (stderr_text or "").lower()
+    return (code in (137, 143)
+            or "command terminated with exit code 137" in lowered
+            or "command terminated with exit code 143" in lowered)
+
+
 def _is_retryable_exec_failure(before, after, stderr_text,
-                               tui_watchdog_exit=False):
+                               tui_watchdog_exit=False,
+                               remote_signal_termination=False):
     """Separate pod/transport loss from an in-pod command failure."""
     diagnostics = _failure_diagnostics(stderr_text, after)
     if _is_permanent_exec_failure(diagnostics):
@@ -537,6 +571,12 @@ def _is_retryable_exec_failure(before, after, stderr_text,
             "command terminated with exit code 75"
             in diagnostics.lower()):
         return True
+    # A signal is lifecycle evidence only when the pod actually changed.  A
+    # bounded settling re-probe is performed by _interactive before this
+    # function is called; if that still sees the same Ready container, do not
+    # disguise a remote application exit as a rollout.
+    if remote_signal_termination:
+        return False
     # kubectl reports a non-zero exit from tui.py this way. If the exact same
     # monitor is still Ready, reconnecting just starts the same crashing command
     # five times and hides its useful diagnostic.
@@ -608,6 +648,27 @@ def _wait_for_ready_pod(namespace, pod, require_health=False,
         delay = min(_RECONNECT_MAX_DELAY_SECONDS, delay * 2)
 
 
+def _settle_signal_termination(namespace, pod, before, after):
+    """Re-probe a briefly stale Ready status after remote SIGKILL/SIGTERM.
+
+    A pod image patch changes spec.image before kubelet updates
+    containerStatuses. A just-ended exec can therefore observe the old Ready
+    container once. Keep this probe short and use only concrete lifecycle
+    changes; a signal with an otherwise identical pod remains fail-fast.
+    """
+    state = after
+    deadline = time.monotonic() + _SIGNAL_SETTLE_SECONDS
+    delay = _SIGNAL_SETTLE_INITIAL_DELAY_SECONDS
+    while not _pod_restarted_or_recreated(before, state):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return state
+        time.sleep(min(delay, remaining))
+        state = _pod_state(namespace, pod)
+        delay = min(1.0, delay * 2)
+    return state
+
+
 def _reconnect_delay(consecutive_failures, random_value=None):
     """Bounded exponential backoff with small jitter for concurrent clients."""
     exponent = min(20, max(0, consecutive_failures - 1))
@@ -655,13 +716,29 @@ def _interactive(namespace, pod, pod_command, no_color):
             pod_after = _pod_state(namespace, pod)
         except KeyboardInterrupt:
             return 130
+        remote_signal_termination = _is_remote_signal_termination(
+            code, stderr_text)
+        post_diagnostics = _failure_diagnostics(stderr_text, pod_after)
+        if (remote_signal_termination and pod_after.get("ready")
+                and not _is_permanent_exec_failure(post_diagnostics)
+                and not _pod_restarted_or_recreated(pod_before, pod_after)):
+            try:
+                pod_after = _settle_signal_termination(
+                    namespace, pod, pod_before, pod_after)
+            except KeyboardInterrupt:
+                return 130
         if not _is_retryable_exec_failure(
                 pod_before, pod_after, stderr_text,
-                tui_watchdog_exit=require_health):
+                tui_watchdog_exit=require_health,
+                remote_signal_termination=remote_signal_termination):
             diagnostics = _failure_diagnostics(stderr_text, pod_after)
             if (_pod_not_found(pod_after)
                     or _is_permanent_exec_failure(diagnostics)):
                 _hint_on_failure(namespace, pod, diagnostics)
+            elif remote_signal_termination:
+                print("sgpu: remote TUI received SIGKILL/SIGTERM but the "
+                      "monitor lifecycle stayed unchanged after settling; "
+                      "not reconnecting", file=sys.stderr)
             else:
                 print("sgpu: monitor session failed without a recoverable pod "
                       "or transport interruption (exit %d); not reconnecting"

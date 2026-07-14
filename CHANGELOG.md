@@ -4,6 +4,21 @@ All notable changes to **sgpu**, newest first. Versions are lockstepped: the
 PyPI client and the `docker.io/alex6095/sgpu-monitor` server image share one
 number so a client never falsely reports itself "behind the server".
 
+## 0.8.20 - Rollout reconnect hotfix
+
+- Fixed a release-blocking race during an in-place monitor container rollout:
+  an active kubectl exec can end with exit 137/143 while its first post-exit
+  get-pod probe still reports the old Ready container.
+- Capture monitor image, container ID, started time, and restart count before
+  exec; after a signal termination, perform a short bounded settling re-probe
+  and reconnect only when concrete same-UID container lifecycle evidence
+  appears.
+- Keep an unchanged Ready pod after the settling window fail-fast, preserving
+  protection against remote application failures while retaining bounded EOF,
+  transport, watchdog, and rollout recovery.
+
+---
+
 ## 0.8.19 - Self-healing sessions and cluster pulse
 
 - Fixed the real long-session failure mode: a disconnected `kubectl exec`
