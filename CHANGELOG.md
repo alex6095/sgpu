@@ -4,6 +4,20 @@ All notable changes to **sgpu**, newest first. Versions are lockstepped: the
 PyPI client and the `docker.io/alex6095/sgpu-monitor` server image share one
 number so a client never falsely reports itself "behind the server".
 
+## 0.8.21 - Instance-ready rollout reconnect hotfix
+
+- Fixed the remaining in-place rollout race: a patched monitor image can be
+  visible while Ready and health still belong to the old container.  A
+  spec-only image change now waits, within the existing bounded recovery
+  window, for a baseline-relative monitor instance transition before a new
+  exec is opened.
+- Require that transitioned instance to be Ready and pass its health check;
+  classify only kubectl's named-container-not-found upgrade diagnostic as the
+  short-lived exec race it is, while preserving fail-fast handling for pod
+  NotFound, RBAC, and same-container application exits.
+
+---
+
 ## 0.8.20 - Rollout reconnect hotfix
 
 - Fixed a release-blocking race during an in-place monitor container rollout:

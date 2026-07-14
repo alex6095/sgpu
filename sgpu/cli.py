@@ -503,14 +503,27 @@ def _pod_running(namespace, pod):
 
 
 def _pod_restarted_or_recreated(before, after):
+    return (_pod_desired_image_changed(before, after)
+            or _pod_instance_changed(before, after))
+
+
+def _pod_desired_image_changed(before, after):
+    """Whether the pod spec now asks for a different monitor image."""
+    return bool(before and after and before.get("monitor_image")
+                and after.get("monitor_image")
+                and before["monitor_image"] != after["monitor_image"])
+
+
+def _pod_instance_changed(before, after):
+    """Whether Kubernetes has actually replaced/restarted the monitor."""
     if not before or not after:
         return False
-    if before.get("uid") and after.get("uid") \
-            and before["uid"] != after["uid"]:
+    if (before.get("uid") and after.get("uid")
+            and before["uid"] != after["uid"]):
         return True
     if after.get("restart_count", 0) > before.get("restart_count", 0):
         return True
-    for field in ("monitor_image", "container_id", "started_at"):
+    for field in ("container_id", "started_at"):
         if (before.get(field) and after.get(field)
                 and before[field] != after[field]):
             return True
@@ -554,6 +567,12 @@ def _is_remote_signal_termination(code, stderr_text):
             or "command terminated with exit code 143" in lowered)
 
 
+def _is_container_exec_race(stderr_text):
+    """The pod exists, but its named container is between exec endpoints."""
+    return ("unable to upgrade connection: container not found (\"monitor\")"
+            in (stderr_text or "").lower())
+
+
 def _is_retryable_exec_failure(before, after, stderr_text,
                                tui_watchdog_exit=False,
                                remote_signal_termination=False):
@@ -566,6 +585,8 @@ def _is_retryable_exec_failure(before, after, stderr_text,
     if _pod_not_found(after) and not (before or {}).get("uid"):
         return False
     if not after.get("ready") or _pod_restarted_or_recreated(before, after):
+        return True
+    if _is_container_exec_race(diagnostics):
         return True
     if tui_watchdog_exit and (
             "command terminated with exit code 75"
@@ -630,16 +651,22 @@ def _monitor_healthy(namespace, pod):
 
 
 def _wait_for_ready_pod(namespace, pod, require_health=False,
-                        timeout=_RECONNECT_RECOVERY_WINDOW_SECONDS):
-    """Wait a bounded amount of time for a Ready (and optionally healthy) pod."""
+                        timeout=_RECONNECT_RECOVERY_WINDOW_SECONDS,
+                        baseline=None, require_instance_change=False):
+    """Wait for a Ready/healthy monitor, optionally after an instance switch."""
     deadline = time.monotonic() + timeout
     delay = _RECONNECT_INITIAL_DELAY_SECONDS
     while True:
         state = _pod_state(namespace, pod)
         now = time.monotonic()
-        if state["ready"] and not require_health:
+        if (require_instance_change
+                and not _pod_instance_changed(baseline, state)):
+            ready_for_exec = False
+        else:
+            ready_for_exec = state["ready"]
+        if ready_for_exec and not require_health:
             return state
-        if state["ready"] and _monitor_healthy(namespace, pod):
+        if ready_for_exec and _monitor_healthy(namespace, pod):
             return state
         remaining = deadline - now
         if remaining <= 0:
@@ -774,10 +801,15 @@ def _interactive(namespace, pod, pod_command, no_color):
             return code
 
         rollout = _pod_restarted_or_recreated(pod_before, pod_after)
+        require_instance_change = (
+            _pod_desired_image_changed(pod_before, pod_after)
+            and not _pod_instance_changed(pod_before, pod_after))
         try:
             ready_state = _wait_for_ready_pod(
                 namespace, pod, require_health=require_health,
-                timeout=max(0.0, recovery_deadline - time.monotonic()))
+                timeout=max(0.0, recovery_deadline - time.monotonic()),
+                baseline=pod_before,
+                require_instance_change=require_instance_change)
         except KeyboardInterrupt:
             return 130
         if ready_state is None:

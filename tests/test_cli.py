@@ -115,6 +115,7 @@ class TestInteractiveReconnect(unittest.TestCase):
         self._exec = cli._interactive_exec
         self._pod_state_fn = cli._pod_state
         self._wait = cli._wait_for_ready_pod
+        self._monitor_healthy = cli._monitor_healthy
         self._monotonic = cli.time.monotonic
         self._sleep = cli.time.sleep
         self._random = cli.random.random
@@ -134,6 +135,7 @@ class TestInteractiveReconnect(unittest.TestCase):
         cli._interactive_exec = self._exec
         cli._pod_state = self._pod_state_fn
         cli._wait_for_ready_pod = self._wait
+        cli._monitor_healthy = self._monitor_healthy
         cli.time.monotonic = self._monotonic
         cli.time.sleep = self._sleep
         cli.random.random = self._random
@@ -208,6 +210,55 @@ class TestInteractiveReconnect(unittest.TestCase):
         self.assertEqual(self.sleeps, [0.25, 1])
         self.assertIn("monitor pod changed", "".join(sys.stderr.buffer))
 
+    def test_spec_change_waits_for_new_instance_then_recovers_exec_race(self):
+        """Never exec into the old Ready container during an image rollout."""
+        before = self._state(
+            uid="same", restart_count=13, monitor_image="monitor:0.8.19",
+            container_id="container:old", started_at="old-start")
+        spec_changed_old_instance = self._state(
+            uid="same", restart_count=13, monitor_image="monitor:0.8.20",
+            container_id="container:old", started_at="old-start")
+        container_absent = self._state(
+            uid="same", ready=False, restart_count=13,
+            monitor_image="monitor:0.8.20", container_id=None,
+            started_at=None)
+        new_instance = self._state(
+            uid="same", restart_count=14, monitor_image="monitor:0.8.20",
+            container_id="container:new", started_at="new-start")
+        # First post-exec state has the new desired image but still reports
+        # the old Ready container.  The real wait must reject it without
+        # sending a /health exec to that container, then observe absence and
+        # a new Ready instance.  The following exec can still race kubelet's
+        # endpoint teardown once; classify that exact diagnostic as transient.
+        states = iter([
+            before,
+            spec_changed_old_instance,
+            spec_changed_old_instance,
+            container_absent,
+            new_instance,
+            new_instance,
+            new_instance,
+        ])
+        cli._pod_state = lambda ns, pod: next(states)
+        health_checks = []
+        cli._monitor_healthy = (
+            lambda ns, pod: health_checks.append((ns, pod)) or True)
+        cli._wait_for_ready_pod = self._wait
+        calls = self._exec_results([
+            (137, "command terminated with exit code 137\n"),
+            (1, "error: Internal error occurred: unable to upgrade connection: "
+                "container not found (\"monitor\")\n"),
+            (0, ""),
+        ])
+
+        self.assertEqual(
+            cli._interactive("ns", "pod", ["python3", "tui.py"], False), 0)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(health_checks, [("ns", "pod"), ("ns", "pod")])
+        self.assertEqual(self.sleeps, [1, 2, 1, 2])
+        self.assertIn("monitor pod changed", "".join(sys.stderr.buffer))
+        self.assertNotIn("not reconnecting", "".join(sys.stderr.buffer))
+
     def test_unchanged_ready_pod_after_signal_fails_fast_after_settling(self):
         state = self._state(restart_count=12)
         clock = [0.0]
@@ -277,6 +328,13 @@ class TestInteractiveReconnect(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(self.sleeps, [])
         self.assertIn("not reconnecting", "".join(sys.stderr.buffer))
+
+    def test_container_not_found_exec_race_is_narrowly_classified(self):
+        self.assertTrue(cli._is_container_exec_race(
+            "Internal error occurred: unable to upgrade connection: "
+            "container not found (\"monitor\")"))
+        self.assertFalse(cli._is_container_exec_race(
+            'Error from server (NotFound): pods "pod" not found'))
 
     def test_auth_failure_does_not_retry_forever(self):
         cli._pod_state = lambda ns, pod: self._state()
